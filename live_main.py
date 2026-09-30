@@ -5,6 +5,12 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from typing import Optional
 
+# Silence httpx request logging to prevent tokens/URLs from leaking in logs
+import logging as py_logging
+py_logging.getLogger("httpx").setLevel(py_logging.WARNING)
+
+from core.datalake import DataLake
+
 from core.datalake import DataLake
 from core.strategy_engine import StrategyEngine
 from core.ai_reviewer import AIReviewer
