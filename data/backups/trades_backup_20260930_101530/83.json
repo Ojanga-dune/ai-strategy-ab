@@ -1,0 +1,15 @@
+{
+    "instrument": "XAU_USD",
+    "entry_price": 4141.115,
+    "units": 53,
+    "sl": 4121.881249999999,
+    "tp": 4179.5824999999995,
+    "ai_reasoning": "Strong structural alignment with bullish trend",
+    "timestamp": "2026-09-29T07:00:00+00:00",
+    "strategy_version": "live_v1",
+    "recorded_at": "2026-09-29T14:16:10.581757",
+    "status": "CLOSED",
+    "pnl": 0.0,
+    "closed_at": "2026-09-29T20:08:55.171015",
+    "reason": "API_UNREACHABLE"
+}

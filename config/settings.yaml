@@ -1,0 +1,15 @@
+oanda:
+  api_key: "YOUR_API_KEY"
+  account_id: "YOUR_ACCOUNT_ID"
+  environment: "practice" # practice or live
+
+ai:
+  model: "claude-3-5-sonnet-20240620"
+  max_tokens: 1024
+  temperature: 0
+
+research:
+  symbols: ["XAU_USD", "NAS100_USD", "BTC_USD"]
+  timeframes: ["M1", "M5", "M15", "H1"]
+  historical_years: 10
+  in_sample_end_date: "2023-01-01"

@@ -1,0 +1,17 @@
+# Dependency and Environment
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+.venv
+venv/
+ENV/
+
+# Data and Logs
+data/lake/**
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/

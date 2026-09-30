@@ -1,0 +1,56 @@
+{
+    "XAU_USD": {
+        "champion": {
+            "version": "live_v1_XAU_USD",
+            "instrument": "XAU_USD",
+            "granularity": "H1",
+            "rules": {
+                "trigger": "pin_bar",
+                "filters": []
+            },
+            "performance": {
+                "win_rate": 0.0,
+                "total_trades": 0,
+                "pnl": 0.0,
+                "wins": 0
+            }
+        },
+        "challengers": []
+    },
+    "BTC_USD": {
+        "champion": {
+            "version": "live_v1_BTC_USD",
+            "instrument": "BTC_USD",
+            "granularity": "H1",
+            "rules": {
+                "trigger": "pin_bar",
+                "filters": []
+            },
+            "performance": {
+                "win_rate": 0.0,
+                "total_trades": 0,
+                "pnl": 0.0,
+                "wins": 0
+            }
+        },
+        "challengers": []
+    },
+    "NAS100_USD": {
+        "champion": {
+            "version": "live_v1_NAS100_USD",
+            "instrument": "NAS100_USD",
+            "granularity": "H1",
+            "rules": {
+                "trigger": "pin_bar",
+                "filters": []
+            },
+            "performance": {
+                "win_rate": 0.0,
+                "total_trades": 0,
+                "pnl": 0.0,
+                "wins": 0
+            }
+        },
+        "challengers": []
+    }
+}

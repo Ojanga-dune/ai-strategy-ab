@@ -1,0 +1,6 @@
+pandas
+pyarrow
+oandapyV20
+requests
+anthropic
+numpy
