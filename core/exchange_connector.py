@@ -77,7 +77,7 @@ class ExchangeConnector(BrokerInterface):
                 mtf_data[gran] = df
         return mtf_data
 
-    def place_market_order(self, instrument: str, lots: float, stop_loss: float = None, take_profit: float = None) -> Dict[str, Any]:
+    def place_market_order(self, instrument: str, lots: float, stop_loss: float = None, take_profit: float = None, client_id: str = None) -> Dict[str, Any]:
         """
         Places a market order.
         NOTE: For OANDA, 'lots' are converted back to 'units' internally.
@@ -90,7 +90,7 @@ class ExchangeConnector(BrokerInterface):
         abs_units = abs(units)
 
         if self.simulation_mode:
-            logger.info(f"[SIMULATION] Order Placed: {side} {abs_units} {instrument} @ Market. SL: {stop_loss}, TP: {take_profit}")
+            logger.info(f"[SIMULATION] Order Placed: {side} {abs_units} {instrument} @ Market. SL: {stop_loss}, TP: {take_profit}, ClientID: {client_id}")
             return {"status": "success", "order_id": "sim_123", "simulation": True}
 
         url = f"{self.base_url}/accounts/{self.account_id}/orders"
@@ -102,6 +102,9 @@ class ExchangeConnector(BrokerInterface):
                 "type": "MARKET",
             }
         }
+
+        if client_id:
+            order_payload["order"]["clientExtensions"] = {"id": client_id}
 
         if stop_loss:
             order_payload["order"]["stopLossOnFill"] = {"price": f"{round_price(stop_loss, instrument):.3f}"}
@@ -311,40 +314,88 @@ class ExchangeConnector(BrokerInterface):
             logger.error(f"Error modifying order {trade_id}: {e}")
             return {"status": "error", "message": str(e)}
 
-    def get_trade_transactions(self, trade_id: str) -> Optional[List[Dict[str, Any]]]:
+    def get_account_transactions(self, from_time: str, to_time: str) -> List[Dict[str, Any]]:
         """
-        Fetches all transactions associated with a specific trade, handling pagination.
-        Used as a fallback to calculate PnL by summing ORDER_FILL events.
+        Fetches all transactions for the account within a time range, handling pagination.
+        Expects ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ
         """
         all_transactions = []
         url = f"{self.base_url}/accounts/{self.account_id}/transactions"
-        params = {"tradeID": trade_id}
+        params = {
+            "from": from_time,
+            "to": to_time,
+            "paginate": "true"
+        }
 
         try:
             while url:
                 response = requests.get(url, headers=self.headers, params=params if '?' not in url else None, timeout=10)
                 if response.status_code != 200:
-                    logger.error(f"Failed to fetch transactions for trade {trade_id}: {response.status_code}")
-                    return None
+                    logger.error(f"Failed to fetch transactions: {response.status_code}")
+                    return all_transactions
 
                 data = response.json()
                 all_transactions.extend(data.get('transactions', []))
 
-                # Handle Pagination: OANDA returns a 'pages' list
                 pages = data.get('pages', [])
                 url = pages[0] if pages else None
-                params = None # Params are already included in the page URL
-
+                params = None
             return all_transactions
         except Exception as e:
-            logger.error(f"Transaction request failed for trade {trade_id}: {e}")
+            logger.error(f"Transaction fetch request failed: {e}")
+            return all_transactions
+
+
+    def check_order_exists(self, client_id: str) -> bool:
+        """
+        Checks if an order with the given client_id already exists on OANDA.
+        Returns True if found, False otherwise.
+        """
+        if self.simulation_mode:
+            return False # Simulation doesn't track IDs on a server
+
+        url = f"{self.base_url}/accounts/{self.account_id}/orders"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                orders = data.get('orders', [])
+                for order in orders:
+                    # Check if the clientExtensions.id matches
+                    if order.get('clientExtensions', {}).get('id') == client_id:
+                        return True
+            else:
+                logger.error(f"Failed to fetch orders for ID check: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Error checking if order {client_id} exists: {e}")
+
+        return False
+
+    def get_trade_id_from_order(self, order_id: str) -> Optional[str]:
+        """
+        Resolves a Trade ID from a given Order ID by checking transactions.
+        """
+        url = f"{self.base_url}/accounts/{self.account_id}/transactions"
+        params = {"orderID": order_id}
+        try:
+            response = requests.get(url, headers=self.headers, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                transactions = data.get('transactions', [])
+                for tx in transactions:
+                    if tx.get('type') == 'ORDER_FILL':
+                        # The fill transaction contains the tradeID
+                        return tx.get('tradeID')
+            return None
+        except Exception as e:
+            logger.error(f"Error resolving trade ID from order {order_id}: {e}")
             return None
 
     def get_market_price(self, instrument: str) -> Dict[str, float]:
         """
         Fetches current Bid and Ask prices separately.
         """
-        url = f"{self.base_url}/pricing"
+        url = f"{self.base_url}/accounts/{self.account_id}/pricing"
         params = {"instruments": instrument.upper()}
         try:
             response = requests.get(url, headers=self.headers, params=params, timeout=10)
@@ -353,10 +404,17 @@ class ExchangeConnector(BrokerInterface):
                 prices = data.get('prices', [])
                 if prices:
                     p = prices[0]
+                    # OANDA returns lists of bids and asks with liquidity
+                    bids = p.get('bids', [])
+                    asks = p.get('asks', [])
+
+                    if not bids or not asks:
+                        return {}
+
                     return {
-                        "bid": float(p['b']),
-                        "ask": float(p['a']),
-                        "mid": float(p['m'])
+                        "bid": float(bids[0]['price']),
+                        "ask": float(asks[0]['price']),
+                        "mid": (float(bids[0]['price']) + float(asks[0]['price'])) / 2
                     }
             return {}
         except Exception as e:

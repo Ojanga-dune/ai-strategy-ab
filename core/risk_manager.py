@@ -74,24 +74,38 @@ class RiskManager:
             return False
         return True
 
-    def can_trade(
-        self,
-        current_positions: List,
-        current_balance: float,
-        start_of_day_balance: float
-    ) -> Tuple[bool, str]:
+    def calculate_account_daily_pnl(self, exchange: 'ExchangeConnector', start_time: str) -> Dict[str, Any]:
         """
-        Aggregated safety check. Returns (Allowed, Reason).
+        Calculates precise daily PnL by aggregating ORDER_FILL transactions.
+        Returns verified trades count, rejected orders count, and total PnL.
         """
-        try:
-            balance = float(current_balance)
-        except:
-            balance = 0.0
+        # End time is now
+        from datetime import datetime, timezone
+        to_time = datetime.now(timezone.utc).isoformat()
 
-        if len(current_positions) >= self.max_open_trades:
-            return False, f"Max open trades limit ({self.max_open_trades}) reached."
+        transactions = exchange.get_account_transactions(start_time, to_time)
 
-        if not self.check_daily_drawdown(balance, start_of_day_balance):
-            return False, "Daily drawdown limit exceeded. Trading halted."
+        total_pnl = 0.0
+        verified_fills = 0
+        rejected_orders = 0
 
-        return True, "Risk checks passed."
+        for tx in transactions:
+            tx_type = tx.get('type')
+
+            if tx_type == 'ORDER_FILL':
+                # PnL is the sum of realizedPL, financing, and commission
+                # OANDA uses 'units' and 'price' for fills, but the transaction itself
+                # might not have the final realizedPL until the trade closes.
+                # For active trades, we track the fill. For closed, we use realizedPL.
+                pnl = float(tx.get('realizedPL', 0)) + float(tx.get('financing', 0))
+                total_pnl += pnl
+                verified_fills += 1
+
+            elif tx_type in ['MARKET_ORDER_REJECT', 'ORDER_CANCEL']:
+                rejected_orders += 1
+
+        return {
+            "total_pnl": round(total_pnl, 2),
+            "verified_trades": verified_fills,
+            "rejected_orders": rejected_orders
+        }

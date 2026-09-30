@@ -27,6 +27,8 @@ from core.portfolio_manager import PortfolioManager
 from core.compliance_guard import ComplianceGuard, SessionFilter, CandleGuard
 from core.state_manager import StateManager
 from core.news_guard import NewsGuard
+from core.signal_tracker import SignalTracker
+from core.circuit_breaker import CircuitBreaker
 
 # Load environment variables
 load_dotenv()
@@ -40,29 +42,27 @@ logger = logging.getLogger("LiveBot")
 def resolve_trade_pnl(exchange: ExchangeConnector, trade_id: str, retries: int = 5, delay: int = 10) -> Optional[float]:
     """
     Attempts to fetch the final PnL of a closed trade.
-    1. Primary: Try Trade Details (realizedPL + financing).
-    2. Fallback: Try Transaction History (sum of ORDER_FILL pl).
+    Primary: Use /trades/{tradeID} -> realizedPL + financing.
     """
     for i in range(retries):
         try:
-            # --- Step 1: Primary Lookup (Trade Details) ---
+            # --- Primary Lookup (Trade Details) ---
+            # This endpoint provides the aggregate PnL for the entire trade lifetime
             trade_details = exchange.get_trade_details(trade_id)
             if trade_details:
+                # OANDA trade details include realizedPL (gain/loss on close)
+                # and financing (swaps/overnight interest).
                 realized = trade_details.get('realizedPL', 0)
                 financing = trade_details.get('financing', 0)
+
                 try:
+                    # Net PnL = Realized Profit/Loss + Financing (swaps)
+                    # Commission is typically bundled in realizedPL or handled at account level
                     total_pnl = float(realized) + float(financing)
-                    logger.info(f"PnL resolved via Trade Details for {trade_id}: {total_pnl:.2f}")
+                    logger.info(f"Net PnL resolved via Trade Details for {trade_id}: {total_pnl:.2f}")
                     return total_pnl
                 except (ValueError, TypeError) as e:
                     logger.warning(f"Failed to cast PnL fields for {trade_id}: {realized}, {financing}. Error: {e}")
-
-            # --- Step 2: Fallback Lookup (Transactions) ---
-            transactions = exchange.get_trade_transactions(trade_id)
-            if transactions:
-                fill_pnl = sum(float(t.get('pl', 0)) for t in transactions if t.get('type') == 'ORDER_FILL')
-                logger.info(f"PnL resolved via Transactions for {trade_id}: {fill_pnl:.2f}")
-                return fill_pnl
 
         except Exception as e:
             logger.error(f"Unexpected error resolving PnL for {trade_id}: {e}")
@@ -73,68 +73,79 @@ def resolve_trade_pnl(exchange: ExchangeConnector, trade_id: str, retries: int =
 
     return None
 
-def manage_active_trades(exchange: ExchangeConnector, tracker: TradeTracker, notifier: NotificationManager, instrument: str):
+def monitor_trade_outcomes(exchange: ExchangeConnector, tracker: TradeTracker, notifier: NotificationManager, registry: StrategyRegistry, monitored_assets: List[Dict]):
     """
-    Dynamic trade management: Handles Break-Even and Trailing Stops.
+    Checks for closed trades and updates their outcomes.
     """
     open_trades = tracker.get_open_trades()
     if not open_trades:
         return
 
-    logger.info(f"Managing {len(open_trades)} active trades for {instrument} risk reduction...")
+    logger.info(f"Monitoring {len(open_trades)} open trades for outcomes...")
+    current_positions = exchange.get_open_positions()
+    current_ids = [p.get('tradeID') for p in current_positions]
 
-    prices = exchange.get_market_price(instrument)
-    if not prices:
-        logger.warning(f"Could not fetch market prices for {instrument} trade management.")
-        return
-
-    current_price = prices['mid']
+    for asset in monitored_assets:
+        instrument = asset['symbol']
+        candles = exchange.get_latest_candles(instrument, "M1", count=1)
+        current_price = candles.iloc[-1]['close'] if not candles.empty else None
 
     for trade in open_trades:
-        t_id = trade['trade_id']
-        if trade.get('instrument') != instrument or trade.get('is_simulated', False):
+        t_local_id = trade['local_id']
+        t_trade_id = trade.get('trade_id')
+        t_order_id = trade.get('order_id')
+        if trade.get('instrument') != instrument:
             continue
 
-        entry_price = trade.get('entry_price')
-        sl = trade.get('sl')
-        tp = trade.get('tp')
+        if not trade.get('is_simulated', False):
+            # Resolve missing TradeID using OrderID if necessary
+            if not t_trade_id and t_order_id:
+                logger.info(f"Resolving missing TradeID for {t_local_id} using OrderID {t_order_id}...")
+                # Use exchange to find the tradeID associated with this order
+                # This typically involves checking /trades or /transactions
+                # For now, we use a placeholder logic or extend ExchangeConnector
+                resolved_trade_id = exchange.get_trade_id_from_order(t_order_id)
+                if resolved_trade_id:
+                    logger.info(f"Resolved TradeID: {resolved_trade_id} for {t_local_id}")
+                    tracker.update_outcome(t_local_id, {"trade_id": resolved_trade_id, "status": "OPEN"})
+                    t_trade_id = resolved_trade_id
 
-        if entry_price is None or sl is None:
-            continue
+            if not t_trade_id:
+                logger.warning(f"Trade {t_local_id} has no OANDA TradeID. Skipping outcome check.")
+                continue
 
-        units = trade.get('units', 0)
-        is_long = units > 0
+            if t_trade_id not in current_ids:
+                    logger.info(f"Trade {t_trade_id} (Local: {t_local_id}) has closed. Updating outcome...")
+                    realized_pnl = resolve_trade_pnl(exchange, t_trade_id)
+                    if realized_pnl is not None:
+                        tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": realized_pnl, "pnl_source": "oanda"})
+                        notifier.send_sync(f"🏁 Trade Closed: {t_trade_id}. PnL: {realized_pnl:.2f}")
+                    else:
+                        tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": None, "pnl_source": "oanda", "failure_reason": "PnL resolution failed"})
+                        notifier.send_sync(f"🏁 Trade Closed: {t_trade_id}. Outcome recorded (PnL missing).")
+            else:
+                if current_price is None: continue
+                entry_price = trade.get('entry_price')
+                sl = trade.get('sl')
+                tp = trade.get('tp')
+                strat_version = trade.get('strategy_version')
+                if sl is None or tp is None: continue
+                is_long = tp > entry_price
+                closed = False
+                pnl = 0.0
+                reason = ""
+                if is_long:
+                    if current_price <= sl: closed, pnl, reason = True, sl - entry_price, "SL Hit"
+                    elif current_price >= tp: closed, pnl, reason = True, tp - entry_price, "TP Hit"
+                else:
+                    if current_price >= sl: closed, pnl, reason = True, entry_price - sl, "SL Hit"
+                    elif current_price <= tp: closed, pnl, reason = True, entry_price - tp, "TP Hit"
+                if closed:
+                    logger.info(f"Shadow Trade {t_local_id} virtually closed ({reason}). PnL: {pnl:.3f}")
+                    tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": pnl, "pnl_source": "estimated", "reason": reason})
+                    registry.update_performance(instrument, strat_version, pnl, pnl > 0, pnl_source="estimated")
+                    notifier.send_sync(f"👻 Shadow Trade {strat_version} closed: {reason} (PnL: {pnl:.3f})")
 
-        risk_dist = abs(entry_price - sl)
-        if is_long:
-            if current_price >= entry_price + risk_dist and sl < entry_price:
-                logger.info(f"Trade {t_id}: Triggering Break-Even.")
-                res = exchange.modify_order(t_id, stop_loss=entry_price)
-                if res.get('status') == 'success':
-                    tracker.update_outcome(t_id, {"sl": entry_price})
-                    notifier.send_sync(f"🛡️ **Break-Even Set**: {t_id}\nSL moved to entry: {entry_price:.3f}")
-        else:
-            if current_price <= entry_price - risk_dist and sl > entry_price:
-                logger.info(f"Trade {t_id}: Triggering Break-Even.")
-                res = exchange.modify_order(t_id, stop_loss=entry_price)
-                if res.get('status') == 'success':
-                    tracker.update_outcome(t_id, {"sl": entry_price})
-                    notifier.send_sync(f"🛡️ **Break-Even Set**: {t_id}\nSL moved to entry: {entry_price:.3f}")
-
-        if is_long:
-            if current_price >= entry_price + (2 * risk_dist) and sl < entry_price + risk_dist:
-                new_sl = entry_price + risk_dist
-                res = exchange.modify_order(t_id, stop_loss=new_sl)
-                if res.get('status') == 'success':
-                    tracker.update_outcome(t_id, {"sl": new_sl})
-                    notifier.send_sync(f"📈 **Trailing Stop Updated**: {t_id}\nNew SL: {new_sl:.3f}")
-        else:
-            if current_price <= entry_price - (2 * risk_dist) and sl > entry_price + risk_dist:
-                new_sl = entry_price - risk_dist
-                res = exchange.modify_order(t_id, stop_loss=new_sl)
-                if res.get('status') == 'success':
-                    tracker.update_outcome(t_id, {"sl": new_sl})
-                    notifier.send_sync(f"📉 **Trailing Stop Updated**: {t_id}\nNew SL: {new_sl:.3f}")
 
 def run_live_cycle(
     instrument: str,
@@ -149,7 +160,11 @@ def run_live_cycle(
     registry: StrategyRegistry,
     session_filter: SessionFilter,
     candle_guard: CandleGuard,
-    news_guard: NewsGuard
+    news_guard: NewsGuard,
+    signal_tracker: SignalTracker,
+    circuit_breaker: CircuitBreaker
+):
+
 ):
     """
     A single iteration of the Live Loop:
@@ -177,9 +192,8 @@ def run_live_cycle(
         gran_map = {'H4': 14400, 'H1': 3600, 'M30': 1800, 'M15': 900, 'M5': 300, 'M1': 60}
         gran_seconds = gran_map.get(granularity, 3600)
 
-        if not candle_guard.is_candle_closed(last_candle_time, gran_seconds):
-            logger.info(f"CandleGuard: Current candle is still forming. Waiting for close.")
-            return
+        # Candle completion is now handled by ExchangeConnector (filters complete:true)
+        # Redundant CandleGuard time-check removed to rely strictly on broker signal.
 
         df = datalake._calculate_indicators(df)
         strategies = registry.get_all_strategies(instrument)
@@ -235,6 +249,12 @@ def run_live_cycle(
             if is_champion:
                 logger.info(f"Champion ({strat_version}) approved a trade. Proceeding to Execution Guard...")
 
+                # --- Global Position Cap Check ---
+                all_open_positions = exchange.get_open_positions()
+                if len(all_open_positions) >= MAX_OPEN_POSITIONS:
+                    logger.warning(f"Guard: Trade blocked. Global position cap reached ({len(all_open_positions)}/{MAX_OPEN_POSITIONS}).")
+                    continue
+
                 summary = exchange.get_account_summary()
                 balance = float(summary.get('balance', 0))
                 equity = float(summary.get('equity', 0))
@@ -267,37 +287,108 @@ def run_live_cycle(
                 max_retries = 3
                 retry_delay = 2
                 result = None
+                consecutive_rejections = 0 # This would need to be persisted/shared across cycles
+
+                # Generate CID before the loop to check for existing orders
+                client_id = f"sig_{strat_version}_{instrument}_{int(latest_trade['timestamp'].timestamp())}"
+
+                # --- Signal Idempotency Check ---
+                if signal_tracker.is_consumed(strat_version, instrument, latest_trade['timestamp'].timestamp()):
+                    logger.info(f"Signal {client_id} already consumed. Skipping to prevent repeated attempts.")
+                    continue
+
+                if exchange.check_order_exists(client_id):
+                    logger.warning(f"Order {client_id} already exists on OANDA. Skipping to prevent double-fill.")
+                    tracker.record_entry(client_id, {"status": "CONSUMED", "reason": "Duplicate ID found on broker"})
+                    signal_tracker.mark_consumed(strat_version, instrument, latest_trade['timestamp'].timestamp())
+                    continue
 
                 for attempt in range(max_retries):
-                    logger.info(f"Executing Champion Order (Attempt {attempt+1}/{max_retries}): {instrument} {side_lots} lots...")
+                    logger.info(f"Executing Champion Order (Attempt {attempt+1}/{max_retries}): {instrument} {side_lots} lots (CID: {client_id})...")
                     result = exchange.place_market_order(
                         instrument=instrument,
                         lots=side_lots,
                         stop_loss=sl_price,
-                        take_profit=tp_price
+                        take_profit=tp_price,
+                        client_id=client_id
                     )
 
-                    if result.get('status') == 'success' or 'orderCreateTransaction' in result:
+                    if result and (result.get('status') == 'success' or 'orderFillTransaction' in result):
                         break
 
-                    error_code = result.get('error_code')
-                    # Do NOT retry 4xx errors (client errors) as they are non-recoverable
-                    if error_code and 400 <= error_code < 500:
-                        logger.warning(f"Order rejected with 4xx error {error_code}. Not retryable.")
-                        break
+                    error_code = result.get('error_code') if result else None
+                    # Ensure error_code is an integer before comparing
+                    if error_code is not None:
+                        try:
+                            code = int(error_code)
+                            # Non-retryable errors: 400 (Bad Request), 401 (Unauthorized), 403 (Forbidden)
+                            # Retryable: 429 (Too Many Requests), 5xx (Server Errors)
+                            if 400 <= code < 500 and code != 429:
+                                logger.warning(f"Non-retryable error {code}: {result.get('message', 'Unknown error')}. Stopping retries.")
+                                break
+                        except (ValueError, TypeError):
+                            logger.warning(f"Order rejected with non-integer error code {error_code}: {result.get('message', 'Unknown error')}. Stopping retries.")
+                            break
+                    else:
+                        # If no error code, but result indicates failure, we might want to break
+                        if result and result.get('status') == 'error':
+                            # We only retry if it's a likely network issue; if it's a structured error without a code, we stop.
+                            break
 
                     if attempt < max_retries - 1:
-                        logger.warning(f"Order failed: {result.get('message')}. Retrying in {retry_delay}s...")
+                        logger.warning(f"Order attempt {attempt+1} failed (Code: {error_code}). Retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
 
-                if not result or (result.get('status') == 'error' and 'orderCreateTransaction' not in result):
-                    error_msg = f"❌ Order Failed after {max_retries} attempts.\n\n💡 Details: {result.get('message', 'Unknown error') if result else 'No response'}"
-                    notifier.send_sync(error_msg)
+                if not result or (result.get('status') == 'error' and 'orderFillTransaction' not in (result or {})):
+                    error_status = result.get('error_code', 'UNKNOWN') if result else 'NETWORK_ERROR'
+                    # Store the full OANDA response for post-mortem analysis.
+                    # We strip tokens to prevent security leaks in the JSON files.
+                    full_response = result if result else 'No response'
+                    if isinstance(full_response, dict) and 'token' in full_response:
+                        full_response = {k: v for k, v in full_response.items() if k != 'token'}
+
+                    reject_record = {
+                        'instrument': instrument,
+                        'lots': side_lots,
+                        'status': 'REJECTED',
+                        'error_code': error_status,
+                        'response': full_response,
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                    }
+
+                    temp_id = (result or {}).get('orderCreateTransaction', {}).get('id', f"rejected_{int(time.time())}")
+                    tracker.record_entry(temp_id, reject_record)
+
+                    # Mark signal as consumed so we don't retry it in the next cycle
+                    signal_tracker.mark_consumed(strat_version, instrument, latest_trade['timestamp'].timestamp())
+
+                    # Record rejection in circuit breaker
+                    tripped, reason = circuit_breaker.record_rejection()
+                    if tripped:
+                        notifier.send_sync(f"🚨 **CIRCUIT BREAKER TRIPPED**\n{reason}\nTrading halted for this account.")
+                        logger.critical(reason)
+
+                    try:
+                        notifier.send_sync(f"🚨 **Order Rejected**\nInstrument: {instrument}\nStatus: {error_status}\nError: {result.get('message', 'Unknown error') if result else 'Network Error'}")
+                    except Exception as e:
+                        logger.error(f"Failed to send Telegram alert for rejected order: {e}")
+
                     continue
 
                 if 'orderCreateTransaction' in result:
-                    trade_id = result['orderCreateTransaction']['id']
+                    order_id = result['orderCreateTransaction']['id']
+
+                    trade_id = None
+                    if 'orderFillTransaction' in result:
+                        fill = result['orderFillTransaction']
+                        if 'tradeOpened' in fill:
+                            trade_id = fill['tradeOpened'].get('tradeID')
+
+                    local_id = f"trade_{int(time.time())}_{order_id}"
+
                     trade_dna = {
+                        'order_id': order_id,
+                        'trade_id': trade_id,
                         'instrument': instrument,
                         'entry_price': latest_trade['price'],
                         'units': side_lots,
@@ -305,23 +396,27 @@ def run_live_cycle(
                         'tp': tp_price,
                         'ai_reasoning': latest_trade.get('ai_reasoning'),
                         'timestamp': latest_trade['timestamp'].isoformat() if hasattr(latest_trade['timestamp'], 'isoformat') else latest_trade['timestamp'],
-                        'strategy_version': strat_version
+                        'strategy_version': strat_version,
+                        'status': 'OPEN' if trade_id else 'PENDING_TRADE_ID'
                     }
-                    tracker.record_entry(trade_id, trade_dna)
+                    tracker.record_entry(local_id, trade_dna)
 
                 if 'orderCancelTransaction' in result:
                     cancel_reason = result['orderCancelTransaction'].get('reason', 'Unknown')
                     error_msg = f"❌ Trade Cancelled: {cancel_reason}\n\n💡 How to fix: This usually happens if the market is halted or the order was too large for current liquidity. Try reducing risk or check OANDA server status."
                     notifier.send_sync(error_msg)
                     if 'orderCreateTransaction' in result:
-                        trade_id = result['orderCreateTransaction']['id']
-                        tracker.update_outcome(trade_id, {"status": "CLOSED", "pnl": 0, "reason": "Cancelled"})
+                        order_id = result['orderCreateTransaction']['id']
+                        # For cancelled orders, we use a derived local ID since there is no tradeID
+                        local_id = f"trade_{int(time.time())}_{order_id}"
+                        tracker.update_outcome(local_id, {"status": "CLOSED", "pnl": 0, "reason": "Cancelled"})
                 elif result.get('status') == 'error':
                     error_msg = f"❌ Order Error: {result.get('message')}\n\n💡 Details: {result.get('raw')}"
                     notifier.send_sync(error_msg)
                     if 'orderCreateTransaction' in result:
-                        trade_id = result['orderCreateTransaction']['id']
-                        tracker.update_outcome(trade_id, {"status": "CLOSED", "pnl": 0, "reason": "Cancelled"})
+                        order_id = result['orderCreateTransaction']['id']
+                        local_id = f"trade_{int(time.time())}_{order_id}"
+                        tracker.update_outcome(local_id, {"status": "CLOSED", "pnl": 0, "reason": "Cancelled"})
                 elif result.get('status') == 'success' or 'orderCreateTransaction' in result:
                     dir_text = "LONG 📈" if side_lots > 0 else "SHORT 📉"
                     exec_msg = (
@@ -438,6 +533,16 @@ def cmd_daily(text, context, tracker, registry):
 
 from core.lock_manager import acquire_lock, release_lock
 
+# --- Global Configuration ---
+MONITORED_ASSETS = [
+    {"symbol": "XAU_USD", "gran": "H1"},
+    {"symbol": "BTC_USD", "gran": "H1"},
+    {"symbol": "NAS100_USD", "gran": "H1"},
+]
+POLL_INTERVAL = 3600  # 1 hour (in seconds)
+MAX_OPEN_POSITIONS = 1    # Maximum allowed open positions across all assets
+FREEZE_POST_MORTEM = True # If True, disables the evolutionary strategy cycle
+
 def main():
     # --- Single Instance Lock ---
     lock_file = "bot.lock"
@@ -447,71 +552,106 @@ def main():
         return
 
     try:
-        # --- Configuration ---
-        MONITORED_ASSETS = [
+        api_key = os.getenv("OANDA_API_KEY")
+        account_id = os.getenv("OANDA_ACCOUNT_ID")
 
-        {"symbol": "XAU_USD", "gran": "H1"},
-        {"symbol": "BTC_USD", "gran": "H1"},
-        {"symbol": "NAS100_USD", "gran": "H1"},
-    ]
-    POLL_INTERVAL = 3600  # 1 hour (in seconds)
+        if not api_key or not account_id:
+            logger.error("Missing OANDA_API_KEY or OANDA_ACCOUNT_ID in environment variables.")
+            return
 
-    api_key = os.getenv("OANDA_API_KEY")
-    account_id = os.getenv("OANDA_ACCOUNT_ID")
+        # --- Initialization ---
+        logger.info("Initializing Autonomous Live Bot...")
 
-    if not api_key or not account_id:
-        logger.error("Missing OANDA_API_KEY or OANDA_ACCOUNT_ID in environment variables.")
+        dl = DataLake()
+        engine = StrategyEngine()
+        reviewer = AIReviewer()
+        risk_manager = RiskManager(risk_per_trade=0.01)
+        tracker = TradeTracker()
+        state_manager = StateManager()
+        evolver = PostMortemAgent()
+        news_guard = NewsGuard()
+        signal_tracker = SignalTracker()
+        circuit_breaker = CircuitBreaker(threshold=5)
+
+        # Recover daily equity benchmark if it exists
+        saved_equity = tracker.load_equity_snapshot()
+        if saved_equity:
+            logger.info(f"Recovered daily equity benchmark from disk: ${saved_equity:.2f}")
+
+
+        backtester = ParallelBacktester(dl)
+        strategist = StrategistAgent(backtester=backtester)
+        registry = StrategyRegistry()
+
+        notifier = NotificationManager(
+            token=os.getenv("TELEGRAM_API_KEY"),
+            chat_id=os.getenv("TELEGRAM_CHAT_ID")
+        )
+
+        # Safety Interlock: Force practice mode unless explicitly enabled
+        is_live_enabled = os.getenv("LIVE_TRADING") == "True"
+        simulation_mode = not is_live_enabled
+
+        # Account ID Prefix Check: 101- (Practice) / 001- (Live)
+        id_prefix = account_id.split('-')[0]
+        if (is_live_enabled and id_prefix == "101") or (not is_live_enabled and id_prefix == "001"):
+            error_msg = f"CRITICAL: Account ID prefix ({id_prefix}) mismatches LIVE_TRADING setting ({is_live_enabled}). Aborting for safety."
+            logger.critical(error_msg)
+            notifier.send_sync(error_msg)
+            return
+
+        # Safety Interlock: Force practice mode unless explicitly enabled
+        is_live_enabled = os.getenv("LIVE_TRADING") == "True"
+        simulation_mode = not is_live_enabled
+
+        # Account ID Prefix Check: 101- (Practice) / 001- (Live)
+        id_prefix = account_id.split('-')[0]
+        if (is_live_enabled and id_prefix == "101") or (not is_live_enabled and id_prefix == "001"):
+            error_msg = f"CRITICAL: Account ID prefix ({id_prefix}) mismatches LIVE_TRADING setting ({is_live_enabled}). Aborting for safety."
+            logger.critical(error_msg)
+            notifier.send_sync(error_msg)
+            return
+
+        exchange = ExchangeConnector(
+            api_key=api_key,
+            account_id=account_id,
+            simulation_mode=simulation_mode
+        )
+
+        portfolio_manager = PortfolioManager()
+        compliance_guard = ComplianceGuard(
+            max_intraday_drawdown=150.0,
+            daily_loss_limit=500.0,
+            max_consecutive_losses=3
+        )
+        session_filter = SessionFilter()
+        candle_guard = CandleGuard()
+
+        notifier.register_callback('positions', lambda t, c: cmd_positions(t, c, exchange))
+        notifier.register_callback('close_all', lambda t, c: cmd_close_all(t, c, exchange))
+        notifier.register_callback('close_partial', lambda t, c: cmd_close_partial(t, c, exchange))
+        notifier.register_callback('move_be', cmd_move_be)
+        notifier.register_callback('daily', lambda t, c: cmd_daily(t, c, tracker, registry))
+        notifier.register_callback('message', portfolio_manager.handle_response)
+
+        logger.info("Performing State Recovery/Reconciliation...")
+        broker_positions = exchange.get_open_positions()
+        synced, mismatch_msg = state_manager.reconcile_with_broker(broker_positions)
+
+        if not synced:
+            alert_msg = f"⚠️ STARTUP MISMATCH: Broker and State are out of sync!\nDetails: {mismatch_msg}\n\nAction: Bot will continue, but please review active trades."
+            logger.warning(alert_msg)
+            notifier.send_sync(alert_msg)
+        else:
+            logger.info("Reconciliation complete. State is synchronized with broker.")
+
+        logger.info(f"Total active positions: {len(broker_positions)}.")
+
+        notifier.start_listener()
+
+    except Exception as e:
+        logger.exception(f"Critical error during bot initialization: {e}")
         return
-
-    # --- Initialization ---
-    logger.info("Initializing Autonomous Live Bot...")
-
-    dl = DataLake()
-    engine = StrategyEngine()
-    reviewer = AIReviewer()
-    risk_manager = RiskManager(risk_per_trade=0.01)
-    tracker = TradeTracker()
-    state_manager = StateManager()
-    evolver = PostMortemAgent()
-    news_guard = NewsGuard()
-
-    backtester = ParallelBacktester(dl)
-    strategist = StrategistAgent(backtester=backtester)
-    registry = StrategyRegistry()
-
-    notifier = NotificationManager(
-        token=os.getenv("TELEGRAM_API_KEY"),
-        chat_id=os.getenv("TELEGRAM_CHAT_ID")
-    )
-
-    exchange = ExchangeConnector(
-        api_key=api_key,
-        account_id=account_id,
-        simulation_mode=False
-    )
-
-    portfolio_manager = PortfolioManager()
-    compliance_guard = ComplianceGuard(
-        max_intraday_drawdown=150.0,
-        daily_loss_limit=500.0,
-        max_consecutive_losses=3
-    )
-    session_filter = SessionFilter()
-    candle_guard = CandleGuard()
-
-    notifier.register_callback('positions', lambda t, c: cmd_positions(t, c, exchange))
-    notifier.register_callback('close_all', lambda t, c: cmd_close_all(t, c, exchange))
-    notifier.register_callback('close_partial', lambda t, c: cmd_close_partial(t, c, exchange))
-    notifier.register_callback('move_be', cmd_move_be)
-    notifier.register_callback('daily', lambda t, c: cmd_daily(t, c, tracker, registry))
-    notifier.register_callback('message', portfolio_manager.handle_response)
-
-    logger.info("Performing State Recovery/Reconciliation...")
-    broker_positions = exchange.get_open_positions()
-    state_manager.reconcile_with_broker(broker_positions)
-    logger.info(f"Reconciliation complete. {len(broker_positions)} positions found on broker.")
-
-    notifier.start_listener()
 
     logger.info(f"Bot is now LIVE. Monitoring {len(MONITORED_ASSETS)} assets every {POLL_INTERVAL}s.")
     logger.info("Press Ctrl+C to stop the bot.")
@@ -520,11 +660,21 @@ def main():
         while True:
             summary = exchange.get_account_summary()
             equity = float(summary.get('equity', 0))
-            compliance_guard.update_daily_start(equity)
+            balance = float(summary.get('balance', 0))
 
-            current_pnl = equity - float(summary.get('balance', 0))
-            is_compliant = True # Bypassed for testing
-            reason = "Compliance bypassed for testing"
+            # Update daily benchmark and persist it to disk
+            compliance_guard.update_daily_start(equity)
+            tracker.save_equity_snapshot(equity)
+
+            # Daily PnL = Current Total Equity - Equity at start of day
+            # This correctly handles balance changes and unrealized PnL
+            start_equity = tracker.load_equity_snapshot() or equity
+            current_pnl = equity - start_equity
+
+            is_compliant, reason = compliance_guard.check_compliance(equity, current_pnl)
+
+
+
 
             if not is_compliant:
                 error_msg = f"🚨 COMPLIANCE VIOLATION: {reason}\n\nExecuting Emergency Shutdown..."
@@ -553,7 +703,8 @@ def main():
                     registry,
                     session_filter,
                     candle_guard,
-                    news_guard
+                    news_guard,
+                    signal_tracker
                 )
 
             open_trades = tracker.get_open_trades()
@@ -568,20 +719,25 @@ def main():
                     current_price = candles.iloc[-1]['close'] if not candles.empty else None
 
                     for trade in open_trades:
-                        t_id = trade['trade_id']
+                        t_local_id = trade['local_id']
+                        t_trade_id = trade.get('trade_id')
                         if trade.get('instrument') != instrument:
                             continue
 
                         if not trade.get('is_simulated', False):
-                            if t_id not in current_ids:
-                                logger.info(f"Trade {t_id} has closed. Updating outcome...")
-                                realized_pnl = resolve_trade_pnl(exchange, t_id)
+                            if not t_trade_id:
+                                logger.warning(f"Trade {t_local_id} has no OANDA TradeID. Skipping outcome check.")
+                                continue
+
+                            if t_trade_id not in current_ids:
+                                logger.info(f"Trade {t_trade_id} (Local: {t_local_id}) has closed. Updating outcome...")
+                                realized_pnl = resolve_trade_pnl(exchange, t_trade_id)
                                 if realized_pnl is not None:
-                                    tracker.update_outcome(t_id, {"status": "CLOSED", "pnl": realized_pnl, "pnl_source": "oanda"})
-                                    notifier.send_sync(f"🏁 Trade Closed: {t_id}. PnL: {realized_pnl:.2f}")
+                                    tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": realized_pnl, "pnl_source": "oanda"})
+                                    notifier.send_sync(f"🏁 Trade Closed: {t_trade_id}. PnL: {realized_pnl:.2f}")
                                 else:
-                                    tracker.update_outcome(t_id, {"status": "CLOSED", "pnl": None, "pnl_source": "oanda", "failure_reason": "PnL resolution failed"})
-                                    notifier.send_sync(f"🏁 Trade Closed: {t_id}. Outcome recorded (PnL missing).")
+                                    tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": None, "pnl_source": "oanda", "failure_reason": "PnL resolution failed"})
+                                    notifier.send_sync(f"🏁 Trade Closed: {t_trade_id}. Outcome recorded (PnL missing).")
                         else:
                             if current_price is None: continue
                             entry_price = trade.get('entry_price')
@@ -600,12 +756,12 @@ def main():
                                 if current_price >= sl: closed, pnl, reason = True, entry_price - sl, "SL Hit"
                                 elif current_price <= tp: closed, pnl, reason = True, entry_price - tp, "TP Hit"
                             if closed:
-                                logger.info(f"Shadow Trade {t_id} virtually closed ({reason}). PnL: {pnl:.3f}")
-                                tracker.update_outcome(t_id, {"status": "CLOSED", "pnl": pnl, "pnl_source": "estimated", "reason": reason})
+                                logger.info(f"Shadow Trade {t_local_id} virtually closed ({reason}). PnL: {pnl:.3f}")
+                                tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": pnl, "pnl_source": "estimated", "reason": reason})
                                 registry.update_performance(instrument, strat_version, pnl, pnl > 0, pnl_source="estimated")
                                 notifier.send_sync(f"👻 Shadow Trade {strat_version} closed: {reason} (PnL: {pnl:.3f})")
 
-            evolver.run_evolutionary_cycle()
+            evolver.run_evolutionary_cycle() if not FREEZE_POST_MORTEM else logger.debug("PostMortemAgent frozen by configuration.")
 
             if datetime.now().hour == 0 and datetime.now().minute == 0:
                 logger.info("Strategist: Scheduled daily strategy generation...")
@@ -633,23 +789,26 @@ def main():
             portfolio_manager.check_health(exchange, notifier)
 
             now_utc = datetime.now(timezone.utc)
+            # --- Daily Performance Summary ---
             if now_utc.hour == 0 and now_utc.minute == 0:
                 logger.info("Scheduling daily performance summary report...")
-                all_trades = tracker.get_all_trades()
-                stats = Analytics().calculate_daily_stats(all_trades)
-                if "status" not in stats:
-                    report_msg = (
-                        f"📊 **Daily Performance Report**\n"
-                        f"Date: {stats['date']}\n"
-                        f"----------------------------\n"
-                        f"Total PnL: ${stats['total_pnl']:.2f}\n"
-                        f"Win Rate: {stats['win_rate']}\n"
-                        f"Trades Closed: {stats['trade_count']}\n"
-                        f"----------------------------"
-                    )
-                    notifier.send_sync(report_msg)
-                else:
-                    notifier.send_sync(f"📊 **Daily Report**: {stats['status']}")
+                # Calculate precise PnL using transactions (Task 9)
+                from datetime import timedelta
+                day_start = (now_utc - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+                daily_stats = risk_manager.calculate_account_daily_pnl(exchange, day_start)
+
+                report_msg = (
+                    f"📊 **Daily Verified Report**\n"
+                    f"Date: {now_utc.strftime('%Y-%m-%d')}\n"
+                    f"----------------------------\n"
+                    f"Total PnL: ${daily_stats['total_pnl']:.2f}\n"
+                    f"Verified Fills: {daily_stats['verified_trades']}\n"
+                    f"Rejected/Cancelled: {daily_stats['rejected_orders']}\n"
+                    f"----------------------------"
+                )
+                notifier.send_sync(report_msg)
+
 
             for asset in MONITORED_ASSETS:
                 manage_active_trades(exchange, tracker, notifier, asset['symbol'])
