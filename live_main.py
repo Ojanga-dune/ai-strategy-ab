@@ -28,6 +28,7 @@ from core.state_manager import StateManager
 from core.news_guard import NewsGuard
 from core.signal_tracker import SignalTracker
 from core.circuit_breaker import CircuitBreaker
+from core.runtime_state import BotRuntimeState
 
 # Load environment variables
 # Now handled by core.config.settings singleton
@@ -607,6 +608,62 @@ def cmd_daily(text, context, tracker, registry):
     )
     return msg
 
+def cmd_status(text, context, exchange, runtime, compliance, tracker, breaker):
+    """Read-only bot health dashboard."""
+    # 1. Basic Health
+    uptime = runtime.get_uptime_str()
+    cycles = runtime.cycle_count
+    last_cycle = runtime.last_cycle_timestamp
+    last_cycle_str = last_cycle.strftime('%H:%M:%S UTC') if last_cycle else "N/A"
+
+    # 2. Connectivity & Environment
+    conn_status = getattr(exchange, 'connection_status', 'UNKNOWN')
+    env = settings.get('oanda_env', 'unknown')
+    sim_mode = settings.get('simulation_mode', False)
+
+    # 3. Account & Compliance
+    summary = exchange.get_account_summary()
+    equity = summary.get('equity') if summary else None
+    pnl = 0.0
+    if summary and tracker.load_equity_snapshot():
+        pnl = equity - tracker.load_equity_snapshot()
+
+    comp_status = compliance.get_status_summary(equity, pnl)
+
+    # 4. Trade State
+    open_trades = tracker.get_open_trades()
+    trade_count = len(open_trades)
+
+    # 5. Safety & Recovery
+    breaker_status = "TRIPPED 🚨" if breaker.is_tripped() else "OK ✅"
+    breaker_reason = breaker.last_reason if breaker.is_tripped() else "N/A"
+    boot_count = settings.get('boot_count', 0) # This should be from state_manager
+
+    # 6. Recent Errors
+    errors = list(runtime.error_buffer)
+    error_msg = "\n".join(errors) if errors else "None"
+
+    report = (
+        f"🤖 **Bot Health Status**\n"
+        f"----------------------------\n"
+        f"Status: RUNNING ✅\n"
+        f"Uptime: {uptime}\n"
+        f"Cycles: {cycles} (Last: {last_cycle_str})\n"
+        f"Bot Starts: {boot_count}\n"
+        f"----------------------------\n"
+        f"OANDA: {conn_status} ({env})\n"
+        f"Simulation: {'Yes' if sim_mode else 'No'}\n"
+        f"Equity: ${equity if equity else 'N/A'}\n"
+        f"Compliance: {comp_status}\n"
+        f"----------------------------\n"
+        f"Open Trades: {trade_count}\n"
+        f"Circuit Breaker: {breaker_status}\n"
+        f"CB Reason: {breaker_reason}\n"
+        f"----------------------------\n"
+        f"Recent Errors:\n{error_msg}"
+    )
+    return report
+
 from core.lock_manager import acquire_lock, release_lock
 
 # --- Global Configuration ---
@@ -621,11 +678,40 @@ FREEZE_POST_MORTEM = True # If True, disables the evolutionary strategy cycle
 
 def main():
     # --- Single Instance Lock ---
+    is_managed = os.getenv("BOT_MANAGED_BY_LAUNCHER", "false").lower() == "true"
+
+    # 1. Check if a managed launcher is already running
+    # The launcher owns 'bot.lock'
     lock_file = "bot.lock"
-    success, pid = acquire_lock(lock_file)
-    if not success:
-        logger.error(f"Another instance of the bot is already running (PID: {pid}). Exiting.")
-        return
+    if os.path.exists(lock_file):
+        try:
+            with open(lock_file, 'r') as f:
+                content = f.read().strip()
+
+            if content:
+                # Expecting launcher_pid|child_pid|started_at
+                parts = content.split('|')
+                if len(parts) >= 1:
+                    launcher_pid = int(parts[0])
+                    import psutil
+                    if psutil.pid_exists(launcher_pid):
+                        if not is_managed:
+                            logger.error("Managed bot instance already running. Manual launch refused.")
+                            return
+                        # If is_managed is True, the launcher is our parent; we are allowed to start.
+        except (ValueError, OSError) as e:
+            logger.debug(f"Could not parse launcher lock: {e}")
+
+    # 2. Handle Direct Launch Protection
+    if not is_managed:
+        direct_lock = "live_main.lock"
+        success, pid = acquire_lock(direct_lock)
+        if not success:
+            logger.error(f"Another manual instance of the bot is already running (PID: {pid}). Exiting.")
+            return
+    else:
+        logger.info("Bot startup: Managed by launcher (skipping local lock acquisition).")
+
 
     try:
         # Configuration is now handled by core.config.settings singleton
@@ -638,7 +724,16 @@ def main():
 
         # --- Initialization ---
         logger.info("Initializing Autonomous Live Bot...")
-        
+
+        # Initialize Runtime State
+        runtime_state = BotRuntimeState()
+
+        # Recover and increment boot count
+        boot_count = state_manager.get_boot_count() + 1
+        state_manager.save_boot_count(boot_count)
+        runtime_state.boot_count = boot_count
+        logger.info(f"Bot Startup: Boot Count = {boot_count}")
+
         # Use absolute path for data directory from settings
         data_dir = settings['data_dir']
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -713,6 +808,7 @@ def main():
         notifier.register_callback('close_partial', lambda t, c: cmd_close_partial(t, c, exchange))
         notifier.register_callback('move_be', cmd_move_be)
         notifier.register_callback('daily', lambda t, c: cmd_daily(t, c, tracker, registry))
+        notifier.register_callback('status', lambda t, c: cmd_status(t, c, exchange, runtime_state, compliance_guard, tracker, circuit_breaker))
         notifier.register_callback('message', portfolio_manager.handle_response)
 
         logger.info("Performing State Recovery/Reconciliation...")
@@ -780,6 +876,24 @@ def main():
                         exchange.place_market_order(inst, -units)
                 return
 
+            # --- Heartbeat Logic ---
+            now_utc = datetime.now(timezone.utc)
+            if runtime_state.last_heartbeat_time is None or \
+               (now_utc - runtime_state.last_heartbeat_time).total_seconds() >= 14400:
+
+                # Generate concise health report for heartbeat
+                heartbeat_msg = (
+                    f"💓 **Bot Heartbeat**\n"
+                    f"Uptime: {runtime_state.get_uptime_str()}\n"
+                    f"Cycles: {runtime_state.cycle_count}\n"
+                    f"Compliance: {compliance_guard.get_status_summary(equity if is_account_available else None, current_pnl)}\n"
+                    f"Trades: {len(tracker.get_open_trades())} open\n"
+                    f"Env: {settings.get('oanda_env', 'unknown')} | Sim: {settings.get('simulation_mode', False)}"
+                )
+                notifier.send_sync(heartbeat_msg)
+                runtime_state.last_heartbeat_time = now_utc
+                logger.info("Heartbeat sent to Telegram.")
+
             for asset in MONITORED_ASSETS:
                 run_live_cycle(
                     asset['symbol'],
@@ -798,8 +912,6 @@ def main():
                     signal_tracker,
                     circuit_breaker
                 )
-
-            open_trades = tracker.get_open_trades()
             if open_trades:
                 for asset in MONITORED_ASSETS:
                     manage_active_trades(exchange, tracker, notifier, asset['symbol'])
