@@ -114,7 +114,11 @@ class ExchangeConnector(BrokerInterface):
         try:
             response = requests.post(url, headers=self.headers, json=order_payload, timeout=10)
             if response.status_code in [200, 201]:
-                return response.json()
+                res = response.json()
+                # If the response contains 'orderCreateTransaction', it's a successful OANDA order
+                if 'orderCreateTransaction' in res:
+                    return {"status": "success", **res}
+                return res
             else:
                 logger.error(f"Order failed with status {response.status_code}: {response.text}")
                 try:
@@ -230,7 +234,11 @@ class ExchangeConnector(BrokerInterface):
         try:
             response = requests.post(url, headers=self.headers, json=payload, timeout=10)
             if response.status_code in [200, 201]:
-                return response.json()
+                res = response.json()
+                # If the response contains 'orderCreateTransaction', it's a successful OANDA order
+                if 'orderCreateTransaction' in res:
+                    return {"status": "success", **res}
+                return res
             else:
                 logger.error(f"SL modification failed for {trade_id}: {response.status_code} - {response.text}")
                 return {"status": "error", "message": response.text}
@@ -330,7 +338,11 @@ class ExchangeConnector(BrokerInterface):
 
             response = requests.post(url, headers=self.headers, json=payload, timeout=10)
             if response.status_code in [200, 201]:
-                return response.json()
+                res = response.json()
+                # If the response contains 'orderCreateTransaction', it's a successful OANDA order
+                if 'orderCreateTransaction' in res:
+                    return {"status": "success", **res}
+                return res
             else:
                 logger.error(f"SL/TP modification failed for {trade_id}: {response.status_code} - {response.text}")
                 return {"status": "error", "message": response.text}
