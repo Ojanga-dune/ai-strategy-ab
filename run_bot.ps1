@@ -70,7 +70,7 @@ while ($true) {
         # PS 5.1 compatible environment variable injection
         $env:BOT_MANAGED_BY_LAUNCHER = "true"
 
-        $Process = Start-Process python -ArgumentList $BotScript -PassThru `
+        $Process = Start-Process 'C:\Users\Admin\AppData\Local\Python\bin\python.exe' -ArgumentList $BotScript -PassThru `
             -RedirectStandardOutput "$LogDir\bot_stdout_$(Get-Date -Format 'yyyyMMdd_HHmmss').log" `
             -RedirectStandardError "$LogDir\bot_stderr_$(Get-Date -Format 'yyyyMMdd_HHmmss').log" `
             -WindowStyle Hidden
@@ -121,3 +121,4 @@ while ($true) {
     Write-BotLog "Restarting bot in $RetryDelay seconds... (Attempt $RetryCount/$MaxRetries)" "WARN"
     Start-Sleep -Seconds $RetryDelay
 }
+
