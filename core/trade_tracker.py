@@ -12,15 +12,29 @@ class TradeTracker:
     Handles persistence of trade 'DNA' and tracks outcomes.
     Stores trades in JSON files within data/trades/
     """
-    def __init__(self, storage_dir: str = "data/trades"):
-        self.storage_dir = Path(storage_dir)
+    def __init__(self, storage_dir: Optional[str] = None):
+        # Use absolute path based on project root if no specific dir provided
+        if storage_dir:
+            self.storage_dir = Path(storage_dir)
+        else:
+            project_root = Path(__file__).parent.parent
+            self.storage_dir = project_root / "data" / "trades"
+
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
-    def record_entry(self, trade_id: str, trade_dna: Dict[str, Any]) -> str:
+    def record_entry(self, local_id: str, trade_dna: Dict[str, Any]) -> str:
         """
         Saves the initial state of a trade (Entry, Reasoning, Confluence).
+        Uses local_id for the filename to maintain stability.
         """
-        file_path = self.storage_dir / f"{trade_id}.json"
+        # Redirect shadow trades to a separate directory
+        storage_path = self.storage_dir
+        if trade_dna.get('is_simulated', False):
+            project_root = Path(__file__).parent.parent
+            storage_path = project_root / "data" / "shadow_trades"
+            storage_path.mkdir(parents=True, exist_ok=True)
+
+        file_path = storage_path / f"{local_id}.json"
 
         # Add timestamp of recording
         trade_dna['recorded_at'] = datetime.utcnow().isoformat()
@@ -29,19 +43,24 @@ class TradeTracker:
         try:
             with open(file_path, 'w') as f:
                 json.dump(trade_dna, f, indent=4)
-            logger.info(f"Trade DNA recorded for {trade_id}")
+            logger.info(f"Trade DNA recorded for {local_id} (TradeID: {trade_dna.get('trade_id')}) in {storage_path}")
             return str(file_path)
         except Exception as e:
             logger.error(f"Failed to record trade DNA: {e}")
             return ""
 
-    def update_outcome(self, trade_id: str, outcome_data: Dict[str, Any]):
+    def update_outcome(self, local_id: str, outcome_data: Dict[str, Any]):
         """
         Updates a trade record with exit details (Exit Price, PnL, Status).
         """
-        file_path = self.storage_dir / f"{trade_id}.json"
+        # Check both main and shadow storage
+        file_path = self.storage_dir / f"{local_id}.json"
         if not file_path.exists():
-            logger.warning(f"No record found for trade {trade_id}. Cannot update outcome.")
+            project_root = Path(__file__).parent.parent
+            file_path = project_root / "data" / "shadow_trades" / f"{local_id}.json"
+
+        if not file_path.exists():
+            logger.warning(f"No record found for {local_id} in main or shadow storage. Cannot update outcome.")
             return
 
         try:
@@ -55,7 +74,7 @@ class TradeTracker:
             with open(file_path, 'w') as f:
                 json.dump(data, f, indent=4)
 
-            logger.info(f"Trade {trade_id} outcome recorded: {outcome_data.get('pnl', 'Unknown PnL')}")
+            logger.info(f"Trade {local_id} outcome recorded: {outcome_data.get('pnl', 'Unknown PnL')}")
         except Exception as e:
             logger.error(f"Failed to update trade outcome: {e}")
 
@@ -68,7 +87,7 @@ class TradeTracker:
             try:
                 with open(file, 'r') as f:
                     data = json.load(f)
-                    data['trade_id'] = file.stem
+                    data['local_id'] = file.stem
                     all_trades.append(data)
             except Exception as e:
                 logger.error(f"Error reading trade file {file}: {e}")
@@ -84,22 +103,49 @@ class TradeTracker:
                 with open(file, 'r') as f:
                     data = json.load(f)
                     if data.get('status') == 'OPEN':
-                        data['trade_id'] = file.stem
+                        data['local_id'] = file.stem
                         open_trades.append(data)
             except Exception as e:
                 logger.error(f"Error reading trade file {file}: {e}")
         return open_trades
 
-    def estimate_pnl(self, trade: Dict[str, Any], current_price: float) -> float:
-        """
-        Calculates an estimated PnL for a trade based on current market price.
-        PnL = (Current Price - Entry Price) * Units (for Longs)
-        """
-        entry_price = trade.get('entry_price')
-        units = trade.get('units', 0)
+    def save_equity_snapshot(self, equity: float):
+        """Persists the start-of-day equity snapshot to disk for compliance recovery."""
+        project_root = Path(__file__).parent.parent
+        snapshot_path = project_root / "data" / "equity_snapshots"
+        snapshot_path.mkdir(parents=True, exist_ok=True)
 
-        if entry_price is None or units == 0:
-            return 0.0
+        filename = f"snapshot_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
+        file_path = snapshot_path / filename
 
-        # If units > 0, it's a LONG. If units < 0, it's a SHORT.
-        return (current_price - entry_price) * units
+        data = {
+            "date": datetime.utcnow().strftime('%Y-%m-%d'),
+            "equity": equity,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+        try:
+            with open(file_path, 'w') as f:
+                json.dump(data, f, indent=4)
+            logger.info(f"Equity snapshot saved: {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to save equity snapshot: {e}")
+
+    def load_equity_snapshot(self) -> Optional[float]:
+        """Loads the equity snapshot for the current date."""
+        project_root = Path(__file__).parent.parent
+        snapshot_path = project_root / "data" / "equity_snapshots"
+        filename = f"snapshot_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
+        file_path = snapshot_path / filename
+
+        if not file_path.exists():
+            return None
+
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+                return float(data.get('equity', 0))
+        except Exception as e:
+            logger.error(f"Failed to load equity snapshot: {e}")
+            return None
+

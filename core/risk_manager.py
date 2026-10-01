@@ -94,12 +94,17 @@ class RiskManager:
 
             if tx_type == 'ORDER_FILL':
                 # PnL is the sum of realizedPL, financing, and commission
-                # OANDA uses 'units' and 'price' for fills, but the transaction itself
-                # might not have the final realizedPL until the trade closes.
-                # For active trades, we track the fill. For closed, we use realizedPL.
-                pnl = float(tx.get('realizedPL', 0)) + float(tx.get('financing', 0))
-                total_pnl += pnl
-                verified_fills += 1
+                # We use .get(key, 0) and float() to ensure robustness against missing fields or strings
+                try:
+                    realized = float(tx.get('realizedPL', 0))
+                    financing = float(tx.get('financing', 0))
+                    commission = float(tx.get('commission', 0))
+
+                    pnl = realized + financing + commission
+                    total_pnl += pnl
+                    verified_fills += 1
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Failed to parse PnL fields for transaction {tx.get('id')}: {e}")
 
             elif tx_type in ['MARKET_ORDER_REJECT', 'ORDER_CANCEL']:
                 rejected_orders += 1

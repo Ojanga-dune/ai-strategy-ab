@@ -9,8 +9,7 @@ from typing import Optional
 import logging as py_logging
 py_logging.getLogger("httpx").setLevel(py_logging.WARNING)
 
-from core.datalake import DataLake
-
+from core.config import settings
 from core.datalake import DataLake
 from core.strategy_engine import StrategyEngine
 from core.ai_reviewer import AIReviewer
@@ -31,13 +30,35 @@ from core.signal_tracker import SignalTracker
 from core.circuit_breaker import CircuitBreaker
 
 # Load environment variables
-load_dotenv()
+# Now handled by core.config.settings singleton
+
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("LiveBot")
+
+def flatten_broker_trade_ids(positions: List[Dict[str, Any]]) -> set:
+    """
+    Extracts all active broker trade IDs from the aggregated OANDA position response.
+    """
+    if positions is None:
+        return set()
+
+    all_ids = set()
+    for pos in positions:
+        # Extract IDs from long block
+        long_ids = pos.get('long', {}).get('tradeIDs', [])
+        if isinstance(long_ids, list):
+            all_ids.update(long_ids)
+
+        # Extract IDs from short block
+        short_ids = pos.get('short', {}).get('tradeIDs', [])
+        if isinstance(short_ids, list):
+            all_ids.update(short_ids)
+
+    return all_ids
 
 def resolve_trade_pnl(exchange: ExchangeConnector, trade_id: str, retries: int = 5, delay: int = 10) -> Optional[float]:
     """
@@ -73,7 +94,39 @@ def resolve_trade_pnl(exchange: ExchangeConnector, trade_id: str, retries: int =
 
     return None
 
-def monitor_trade_outcomes(exchange: ExchangeConnector, tracker: TradeTracker, notifier: NotificationManager, registry: StrategyRegistry, monitored_assets: List[Dict]):
+def manage_active_trades(exchange: ExchangeConnector, tracker: TradeTracker, notifier: NotificationManager, instrument: str):
+    """
+    SAFE COORDINATOR: Reconciles local trade state with broker positions.
+    Does NOT implement automated trading rules (BE, Trailing, etc.) as none are defined.
+    Delegates closure detection and recording to monitor_trade_outcomes.
+    """
+    try:
+        # 1. Obtain local open trades
+        local_open = tracker.get_open_trades()
+
+        # 2. Obtain broker positions (authoritative state)
+        try:
+            broker_positions = exchange.get_open_positions(instrument)
+            if broker_positions is None:
+                # This is an API failure
+                raise ValueError("Broker API returned None (Failure)")
+        except Exception as e:
+            logger.error(f"Broker query failed for {instrument}: {e}. Skipping active management to prevent erroneous closures.")
+            return
+
+        # Extract all active IDs using the flatten helper
+        active_ids = flatten_broker_trade_ids(broker_positions)
+
+        logger.info(f"Active Management [{instrument}]: Local Trades: {len(local_open)}, Broker Trade IDs: {len(active_ids)}")
+
+        # 3. Reconciliation is now handled purely by monitor_trade_outcomes
+        # based on the identified authoritative ID set.
+        monitor_trade_outcomes(exchange, tracker, notifier, StrategyRegistry(), MONITORED_ASSETS, active_ids)
+
+    except Exception as e:
+        logger.error(f"Error in manage_active_trades for {instrument}: {e}")
+
+def monitor_trade_outcomes(exchange: ExchangeConnector, tracker: TradeTracker, notifier: NotificationManager, registry: StrategyRegistry, monitored_assets: List[Dict], active_broker_ids: set = None):
     """
     Checks for closed trades and updates their outcomes.
     """
@@ -81,70 +134,95 @@ def monitor_trade_outcomes(exchange: ExchangeConnector, tracker: TradeTracker, n
     if not open_trades:
         return
 
-    logger.info(f"Monitoring {len(open_trades)} open trades for outcomes...")
-    current_positions = exchange.get_open_positions()
-    current_ids = [p.get('tradeID') for p in current_positions]
+    # If active_broker_ids was not passed (e.g. called from elsewhere), fetch them
+    if active_broker_ids is None:
+        broker_pos = exchange.get_open_positions()
+        if broker_pos is None:
+            logger.warning("Outcome monitor: Broker positions unavailable. Skipping closure checks.")
+            return
+        active_broker_ids = flatten_broker_trade_ids(broker_pos)
 
+    logger.info(f"Monitoring {len(open_trades)} open trades for outcomes...")
+
+    # Optimization: pre-fetch common data for shadow trades
+    current_prices = {}
     for asset in monitored_assets:
         instrument = asset['symbol']
         candles = exchange.get_latest_candles(instrument, "M1", count=1)
-        current_price = candles.iloc[-1]['close'] if not candles.empty else None
+        if not candles.empty:
+            current_prices[instrument] = candles.iloc[-1]['close']
 
     for trade in open_trades:
         t_local_id = trade['local_id']
         t_trade_id = trade.get('trade_id')
         t_order_id = trade.get('order_id')
-        if trade.get('instrument') != instrument:
+
+        # --- Shadow Trade Handling ---
+        if trade.get('is_simulated', False):
+            instrument = trade.get('instrument')
+            if instrument not in current_prices: continue
+            current_price = current_prices[instrument]
+
+            entry_price = trade.get('entry_price')
+            sl = trade.get('sl')
+            tp = trade.get('tp')
+            strat_version = trade.get('strategy_version')
+            if sl is None or tp is None: continue
+
+            is_long = tp > entry_price
+            closed = False
+            pnl = 0.0
+            reason = ""
+            if is_long:
+                if current_price <= sl: closed, pnl, reason = True, sl - entry_price, "SL Hit"
+                elif current_price >= tp: closed, pnl, reason = True, tp - entry_price, "TP Hit"
+            else:
+                if current_price >= sl: closed, pnl, reason = True, entry_price - sl, "SL Hit"
+                elif current_price <= tp: closed, pnl, reason = True, entry_price - tp, "TP Hit"
+
+            if closed:
+                logger.info(f"Shadow Trade {t_local_id} virtually closed ({reason}). PnL: {pnl:.3f}")
+                tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": pnl, "pnl_source": "estimated", "reason": reason})
+                registry.update_performance(instrument, strat_version, pnl, pnl > 0, pnl_source="estimated")
+                notifier.send_sync(f"👻 Shadow Trade {strat_version} closed: {reason} (PnL: {pnl:.3f})")
             continue
 
-        if not trade.get('is_simulated', False):
-            # Resolve missing TradeID using OrderID if necessary
-            if not t_trade_id and t_order_id:
-                logger.info(f"Resolving missing TradeID for {t_local_id} using OrderID {t_order_id}...")
-                # Use exchange to find the tradeID associated with this order
-                # This typically involves checking /trades or /transactions
-                # For now, we use a placeholder logic or extend ExchangeConnector
-                resolved_trade_id = exchange.get_trade_id_from_order(t_order_id)
-                if resolved_trade_id:
-                    logger.info(f"Resolved TradeID: {resolved_trade_id} for {t_local_id}")
-                    tracker.update_outcome(t_local_id, {"trade_id": resolved_trade_id, "status": "OPEN"})
-                    t_trade_id = resolved_trade_id
-
-            if not t_trade_id:
-                logger.warning(f"Trade {t_local_id} has no OANDA TradeID. Skipping outcome check.")
+        # --- Live Trade Handling ---
+        if not t_trade_id and t_order_id:
+            logger.info(f"Resolving missing TradeID for {t_local_id} using OrderID {t_order_id}...")
+            resolved_trade_id = exchange.get_trade_id_from_order(t_order_id)
+            if resolved_trade_id:
+                logger.info(f"Resolved TradeID: {resolved_trade_id} for {t_local_id}")
+                tracker.update_outcome(t_local_id, {"trade_id": resolved_trade_id, "status": "OPEN"})
+                t_trade_id = resolved_trade_id
+            else:
+                logger.warning(f"Trade {t_local_id} still lacks a valid TradeID. Retrying next cycle.")
                 continue
 
-            if t_trade_id not in current_ids:
-                    logger.info(f"Trade {t_trade_id} (Local: {t_local_id}) has closed. Updating outcome...")
-                    realized_pnl = resolve_trade_pnl(exchange, t_trade_id)
-                    if realized_pnl is not None:
-                        tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": realized_pnl, "pnl_source": "oanda"})
-                        notifier.send_sync(f"🏁 Trade Closed: {t_trade_id}. PnL: {realized_pnl:.2f}")
-                    else:
-                        tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": None, "pnl_source": "oanda", "failure_reason": "PnL resolution failed"})
-                        notifier.send_sync(f"🏁 Trade Closed: {t_trade_id}. Outcome recorded (PnL missing).")
-            else:
-                if current_price is None: continue
-                entry_price = trade.get('entry_price')
-                sl = trade.get('sl')
-                tp = trade.get('tp')
-                strat_version = trade.get('strategy_version')
-                if sl is None or tp is None: continue
-                is_long = tp > entry_price
-                closed = False
-                pnl = 0.0
-                reason = ""
-                if is_long:
-                    if current_price <= sl: closed, pnl, reason = True, sl - entry_price, "SL Hit"
-                    elif current_price >= tp: closed, pnl, reason = True, tp - entry_price, "TP Hit"
-                else:
-                    if current_price >= sl: closed, pnl, reason = True, entry_price - sl, "SL Hit"
-                    elif current_price <= tp: closed, pnl, reason = True, entry_price - tp, "TP Hit"
-                if closed:
-                    logger.info(f"Shadow Trade {t_local_id} virtually closed ({reason}). PnL: {pnl:.3f}")
-                    tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": pnl, "pnl_source": "estimated", "reason": reason})
-                    registry.update_performance(instrument, strat_version, pnl, pnl > 0, pnl_source="estimated")
-                    notifier.send_sync(f"👻 Shadow Trade {strat_version} closed: {reason} (PnL: {pnl:.3f})")
+        if not t_trade_id:
+            logger.warning(f"Trade {t_local_id} has no OANDA TradeID and cannot be reconciled. Skipping.")
+            continue
+
+        if t_trade_id in active_broker_ids:
+            continue
+
+        logger.info(f"Trade {t_trade_id} (Local: {t_local_id}) missing from active positions. Verifying closure...")
+        trade_details = exchange.get_trade_details(t_trade_id)
+
+        if trade_details is None:
+            logger.warning(f"Trade {t_trade_id} details unavailable (API failure). Preserving OPEN state.")
+            continue
+
+        # Only proceed to close if broker confirms trade is closed (missing from positions AND details available)
+        # Actually, get_trade_details returns the trade regardless of open/closed status.
+        # The fact that it's missing from active_broker_ids is the primary trigger.
+        # We just need to resolve PnL.
+        realized_pnl = resolve_trade_pnl(exchange, t_trade_id)
+        if realized_pnl is not None:
+            tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": realized_pnl, "pnl_source": "oanda"})
+            notifier.send_sync(f"🏁 Trade Closed: {t_trade_id}. PnL: {realized_pnl:.2f}")
+        else:
+            logger.warning(f"Trade {t_trade_id} closure confirmed, but PnL resolution failed. Retrying next cycle.")
 
 
 def run_live_cycle(
@@ -163,8 +241,6 @@ def run_live_cycle(
     news_guard: NewsGuard,
     signal_tracker: SignalTracker,
     circuit_breaker: CircuitBreaker
-):
-
 ):
     """
     A single iteration of the Live Loop:
@@ -552,8 +628,9 @@ def main():
         return
 
     try:
-        api_key = os.getenv("OANDA_API_KEY")
-        account_id = os.getenv("OANDA_ACCOUNT_ID")
+        # Configuration is now handled by core.config.settings singleton
+        api_key = settings.api_key
+        account_id = settings.account_id
 
         if not api_key or not account_id:
             logger.error("Missing OANDA_API_KEY or OANDA_ACCOUNT_ID in environment variables.")
@@ -561,8 +638,12 @@ def main():
 
         # --- Initialization ---
         logger.info("Initializing Autonomous Live Bot...")
-
-        dl = DataLake()
+        
+        # Use absolute path for data directory from settings
+        data_dir = settings.data_dir
+        data_dir.mkdir(parents=True, exist_ok=True)
+        
+        dl = DataLake(api_key=api_key, account_id=account_id)
         engine = StrategyEngine()
         reviewer = AIReviewer()
         risk_manager = RiskManager(risk_per_trade=0.01)
@@ -589,7 +670,7 @@ def main():
         )
 
         # Safety Interlock: Force practice mode unless explicitly enabled
-        is_live_enabled = os.getenv("LIVE_TRADING") == "True"
+        is_live_enabled = os.getenv("LIVE_TRADING", "False").lower() == "true"
         simulation_mode = not is_live_enabled
 
         # Account ID Prefix Check: 101- (Practice) / 001- (Live)
@@ -601,7 +682,7 @@ def main():
             return
 
         # Safety Interlock: Force practice mode unless explicitly enabled
-        is_live_enabled = os.getenv("LIVE_TRADING") == "True"
+        is_live_enabled = os.getenv("LIVE_TRADING", "False").lower() == "true"
         simulation_mode = not is_live_enabled
 
         # Account ID Prefix Check: 101- (Practice) / 001- (Live)
@@ -704,62 +785,14 @@ def main():
                     session_filter,
                     candle_guard,
                     news_guard,
-                    signal_tracker
+                    signal_tracker,
+                    circuit_breaker
                 )
 
             open_trades = tracker.get_open_trades()
             if open_trades:
-                logger.info(f"Monitoring {len(open_trades)} open trades for outcomes...")
-                current_positions = exchange.get_open_positions()
-                current_ids = [p.get('tradeID') for p in current_positions]
-
                 for asset in MONITORED_ASSETS:
-                    instrument = asset['symbol']
-                    candles = exchange.get_latest_candles(instrument, "M1", count=1)
-                    current_price = candles.iloc[-1]['close'] if not candles.empty else None
-
-                    for trade in open_trades:
-                        t_local_id = trade['local_id']
-                        t_trade_id = trade.get('trade_id')
-                        if trade.get('instrument') != instrument:
-                            continue
-
-                        if not trade.get('is_simulated', False):
-                            if not t_trade_id:
-                                logger.warning(f"Trade {t_local_id} has no OANDA TradeID. Skipping outcome check.")
-                                continue
-
-                            if t_trade_id not in current_ids:
-                                logger.info(f"Trade {t_trade_id} (Local: {t_local_id}) has closed. Updating outcome...")
-                                realized_pnl = resolve_trade_pnl(exchange, t_trade_id)
-                                if realized_pnl is not None:
-                                    tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": realized_pnl, "pnl_source": "oanda"})
-                                    notifier.send_sync(f"🏁 Trade Closed: {t_trade_id}. PnL: {realized_pnl:.2f}")
-                                else:
-                                    tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": None, "pnl_source": "oanda", "failure_reason": "PnL resolution failed"})
-                                    notifier.send_sync(f"🏁 Trade Closed: {t_trade_id}. Outcome recorded (PnL missing).")
-                        else:
-                            if current_price is None: continue
-                            entry_price = trade.get('entry_price')
-                            sl = trade.get('sl')
-                            tp = trade.get('tp')
-                            strat_version = trade.get('strategy_version')
-                            if sl is None or tp is None: continue
-                            is_long = tp > entry_price
-                            closed = False
-                            pnl = 0.0
-                            reason = ""
-                            if is_long:
-                                if current_price <= sl: closed, pnl, reason = True, sl - entry_price, "SL Hit"
-                                elif current_price >= tp: closed, pnl, reason = True, tp - entry_price, "TP Hit"
-                            else:
-                                if current_price >= sl: closed, pnl, reason = True, entry_price - sl, "SL Hit"
-                                elif current_price <= tp: closed, pnl, reason = True, entry_price - tp, "TP Hit"
-                            if closed:
-                                logger.info(f"Shadow Trade {t_local_id} virtually closed ({reason}). PnL: {pnl:.3f}")
-                                tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": pnl, "pnl_source": "estimated", "reason": reason})
-                                registry.update_performance(instrument, strat_version, pnl, pnl > 0, pnl_source="estimated")
-                                notifier.send_sync(f"👻 Shadow Trade {strat_version} closed: {reason} (PnL: {pnl:.3f})")
+                    manage_active_trades(exchange, tracker, notifier, asset['symbol'])
 
             evolver.run_evolutionary_cycle() if not FREEZE_POST_MORTEM else logger.debug("PostMortemAgent frozen by configuration.")
 
@@ -819,6 +852,11 @@ def main():
         logger.info("Bot stopped by user.")
     finally:
         release_lock("bot.lock")
+        # Ensure Telegram listener is stopped cleanly on exit
+        try:
+            notifier.stop_listener()
+        except Exception as e:
+            logger.error(f"Error stopping Telegram listener: {e}")
 
 if __name__ == "__main__":
     main()

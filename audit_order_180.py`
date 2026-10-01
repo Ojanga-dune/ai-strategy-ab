@@ -1,0 +1,39 @@
+import os
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from core.exchange_connector import ExchangeConnector
+from dotenv import load_dotenv
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger("TxAudit")
+
+load_dotenv()
+
+def audit_order_180():
+    api_key = os.getenv("OANDA_API_KEY")
+    account_id = os.getenv("OANDA_ACCOUNT_ID")
+    exchange = ExchangeConnector(api_key=api_key, account_id=account_id, simulation_mode=False)
+
+    # Fetch last 2 hours of transactions
+    from_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    to_time = datetime.now(timezone.utc).isoformat()
+
+    logger.info(f"Fetching all transactions since {from_time}...")
+    txs = exchange.get_account_transactions(from_time, to_time)
+    logger.info(f"Found {len(txs)} total transactions.")
+
+    target_oid = "180"
+    matches = [tx for tx in txs if tx.get('orderID') == target_oid]
+
+    if not matches:
+        logger.error(f"No transactions found for Order ID {target_oid} in the last 2 hours.")
+        return
+
+    print(f"\n=== Transactions for Order {target_oid} ===")
+    for tx in matches:
+        print(json.dumps(tx, indent=2))
+    print("==========================================\n")
+
+if __name__ == "__main__":
+    audit_order_180()

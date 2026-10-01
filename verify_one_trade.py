@@ -1,20 +1,17 @@
 import os
 import logging
 import time
-from datetime import datetime
 from dotenv import load_dotenv
 from core.exchange_connector import ExchangeConnector
 from core.precision_utils import round_price
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("VerifyOneTrade")
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("TradeVerifier")
 
-def run_verification():
-    load_dotenv()
+load_dotenv()
+
+def verify_single_trade():
     api_key = os.getenv("OANDA_API_KEY")
     account_id = os.getenv("OANDA_ACCOUNT_ID")
 
@@ -22,90 +19,104 @@ def run_verification():
         logger.error("Missing OANDA_API_KEY or OANDA_ACCOUNT_ID in .env")
         return
 
+    # Force simulation_mode=False to test real API connectivity
     exchange = ExchangeConnector(api_key=api_key, account_id=account_id, simulation_mode=False)
-    
+
     instrument = "XAU_USD"
-    
-    # 1. Get current price using the FIXED method in ExchangeConnector
-    logger.info(f"Fetching market price for {instrument}...")
-    price_data = exchange.get_market_price(instrument)
-    
-    if not price_data:
-        logger.error("Could not fetch market price. Please check API connectivity.")
-        return
-    
-    current_price = price_data['mid']
-    # Set a wide SL/TP to ensure it doesn't trigger immediately
-    sl = current_price - 10.0
-    tp = current_price + 10.0
-    
-    logger.info(f"Attempting minimum-size order for {instrument}")
-    logger.info(f"Entry: {current_price:.2f} | SL: {sl:.2f} | TP: {tp:.2f}")
-
-    # 2. Place Order
-    result = exchange.place_market_order(
-        instrument=instrument,
-        lots=0.01, 
-        stop_loss=sl,
-        take_profit=tp,
-        client_id=f"verify_{int(time.time())}"
-    )
-    
-    if not result or ('orderCreateTransaction' not in result and result.get('status') == 'error'):
-        logger.error(f"Order failed: {result}")
+    lots = 0.01  # Minimum size
+    # Use current market price to set a realistic SL/TP
+    pricing = exchange.get_market_price(instrument)
+    if not pricing:
+        logger.error("Could not fetch market price.")
         return
 
-    order_id = result.get('orderCreateTransaction', {}).get('id')
-    if not order_id:
-        logger.error(f"Order placed but no orderID found in response: {result}")
-        return
+    current_price = pricing['mid']
+    sl = current_price - 5.0 if True else current_price + 5.0 # Simple offset
+    tp = current_price + 10.0 if True else current_price - 10.0
 
-    logger.info(f"Order Placed. OrderID: {order_id}")
+    try:
+        # 1. Place Order
+        logger.info(f"Step 1: Placing minimum order for {instrument}...")
+        order_result = exchange.place_market_order(
+            instrument=instrument,
+            lots=lots,
+            stop_loss=sl,
+            take_profit=tp,
+            client_id=f"verify_{int(time.time())}"
+        )
 
-    # 3. Extract TradeID from fill
-    trade_id = None
-    if 'orderFillTransaction' in result:
-        trade_id = result['orderFillTransaction'].get('tradeOpened', {}).get('tradeID')
-    
-    if not trade_id:
-        logger.info("TradeID not in response, polling transactions...")
-        time.sleep(2)
+        if 'orderCreateTransaction' not in order_result:
+            logger.error(f"Order placement failed: {order_result}")
+            return
+
+        order_id = order_result['orderCreateTransaction']['id']
+        print(f"\n[SUCCESS] Order Placed: Order ID = {order_id}")
+
+        # 2. Resolve Trade ID
+        logger.info("Step 2: Resolving Trade ID...")
+        trade_id = None
+
+        # Strategy A: Try Transaction Lookup
         trade_id = exchange.get_trade_id_from_order(order_id)
 
-    if not trade_id:
-        logger.error(f"Could not resolve TradeID for Order {order_id}")
-        return
+        # Strategy B: Fallback to Open Positions lookup
+        if not trade_id:
+            logger.info("Transaction lookup failed. Trying Open Positions lookup...")
+            positions = exchange.get_open_positions(instrument)
+            logger.info(f"Debug: Found {len(positions)} open positions for {instrument}: {positions}")
+            for pos in positions:
+                long_block = pos.get('long', {})
+                short_block = pos.get('short', {})
+                long_units = int(float(long_block.get('units', 0)))
+                short_units = int(float(short_block.get('units', 0)))
+                
+                if long_units != 0:
+                    tids = long_block.get('tradeIDs', [])
+                    if tids:
+                        trade_id = tids[0]
+                        logger.info(f"Found Trade ID {trade_id} via long position.")
+                        break
+                elif short_units != 0:
+                    tids = short_block.get('tradeIDs', [])
+                    if tids:
+                        trade_id = tids[0]
+                        logger.info(f"Found Trade ID {trade_id} via short position.")
+                        break
+        
+        if not trade_id:
+            logger.error("Could not resolve Trade ID via transactions or open positions.")
+            return
+        print(f"[SUCCESS] Resolved: Trade ID = {trade_id}")
+        # 3. Check SL/TP Order IDs
+        logger.info("Step 3: Fetching Trade Details for SL/TP IDs...")
+        details = exchange.get_trade_details(trade_id)
+        if details:
+            # OANDA details might contain associated order IDs for SL/TP
+            # depending on the API version/response structure
+            print(f"[SUCCESS] Trade Details: {details}")
+        else:
+            logger.warning("Could not fetch trade details.")
 
-    logger.info(f"Trade Resolved. TradeID: {trade_id}")
 
-    # 4. Verify SL and TP on the trade
-    trade_details = exchange.get_trade_details(trade_id)
-    if trade_details:
-        sl_actual = trade_details.get('stopLossOnFill', {}).get('price')
-        tp_actual = trade_details.get('takeProfitOnFill', {}).get('price')
-        logger.info(f"Broker Verified SL: {sl_actual} | TP: {tp_actual}")
-    else:
-        logger.error("Could not fetch trade details for verification.")
+        # 4. Close Trade
+        logger.info("Step 4: Closing trade...")
+        close_result = exchange.close_position(trade_id)
+        if close_result.get('status') == 'error':
+            logger.error(f"Close failed: {close_result.get('message')}")
+            return
+        print(f"[SUCCESS] Trade closed successfully.")
 
-    # 5. Close the trade
-    logger.info(f"Closing trade {trade_id}...")
-    close_result = exchange.close_position(trade_id)
-    
-    if close_result.get('status') == 'success' or 'orderCreateTransaction' in close_result:
-        logger.info("Trade closed successfully.")
-    else:
-        logger.error(f"Failed to close trade: {close_result}")
+        # 5. Print Realized PnL
+        logger.info("Step 5: Fetching final realized PnL...")
+        final_details = exchange.get_trade_details(trade_id)
+        if final_details:
+            pnl = final_details.get('realizedPL', 'N/A')
+            print(f"[SUCCESS] Final Realized PnL: {pnl}")
+        else:
+            logger.error("Could not fetch final PnL.")
 
-    # 6. Print realized PnL
-    time.sleep(2)
-    final_details = exchange.get_trade_details(trade_id)
-    if final_details:
-        realized = final_details.get('realizedPL', 0)
-        financing = final_details.get('financing', 0)
-        logger.info(f"Final Realized PnL: {realized} | Financing: {financing}")
-        logger.info(f"Net PnL: {float(realized) + float(financing):.2f}")
-    else:
-        logger.error("Could not fetch final trade details for PnL.")
+    except Exception as e:
+        logger.exception(f"Verification failed with error: {e}")
 
 if __name__ == "__main__":
-    run_verification()
+    verify_single_trade()

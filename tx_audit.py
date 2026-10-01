@@ -1,24 +1,32 @@
-import os, requests
+import os
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from core.exchange_connector import ExchangeConnector
 from dotenv import load_dotenv
 
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger("TxAudit")
+
 load_dotenv()
-api_key = os.getenv('OANDA_API_KEY')
-account_id = os.getenv('OANDA_ACCOUNT_ID')
-headers = {"Authorization": f"Bearer {api_key}"}
 
-def main():
-    url = f"https://api-fxpractice.oanda.com/v3/accounts/{account_id}/transactions"
-    res = requests.get(url, headers=headers)
-    if res.status_code == 200:
-        txs = res.json().get('transactions', [])
-        # Transactions IDs are strings, we'll find those in range 160-167
-        # Note: IDs are not necessarily sequential integers, but we'll check
-        for t in txs:
-            tid = t.get('id', '')
-            if tid and tid.isdigit() and 160 <= int(tid) <= 167:
-                print(f"ID: {tid} | Type: {t.get('type')} | Data: {t}")
-    else:
-        print(f"Error: {res.status_code}")
+def audit_recent_orders():
+    api_key = os.getenv("OANDA_API_KEY")
+    account_id = os.getenv("OANDA_ACCOUNT_ID")
+    exchange = ExchangeConnector(api_key=api_key, account_id=account_id, simulation_mode=False)
 
-if __name__ == '__main__':
-    main()
+    from_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    to_time = datetime.now(timezone.utc).isoformat()
+
+    logger.info(f"Fetching all transactions since {from_time}...")
+    txs = exchange.get_account_transactions(from_time, to_time)
+    logger.info(f"Found {len(txs)} total transactions.")
+
+    # Let's list all transactions to see what's actually happening
+    print(f"\n{'Time':<25} | {'Type':<20} | {'OrderID':<15} | {'TradeID':<15}")
+    print("-" * 80)
+    for tx in txs:
+        print(f"{tx.get('time', 'N/A'):<25} | {tx.get('type', 'N/A'):<20} | {tx.get('orderID', 'N/A'):<15} | {tx.get('tradeID', 'N/A'):<15}")
+
+if __name__ == "__main__":
+    audit_recent_orders()

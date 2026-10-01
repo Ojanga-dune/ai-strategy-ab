@@ -129,9 +129,10 @@ class ExchangeConnector(BrokerInterface):
             logger.error(f"Order execution request failed: {e}")
             return {"status": "error", "message": str(e), "raw": str(e)}
 
-    def get_account_summary(self) -> Dict[str, Any]:
+    def get_account_summary(self) -> Optional[Dict[str, Any]]:
         """
         Returns current balance and equity for RiskManager calculations.
+        Returns None if the request fails or returns a non-200 status.
         """
         url = f"{self.base_url}/accounts/{self.account_id}"
         try:
@@ -141,10 +142,10 @@ class ExchangeConnector(BrokerInterface):
                 return res.get('account', res)
             else:
                 logger.error(f"Failed to fetch account summary: {response.status_code} - {response.text}")
-                return {}
+                return None
         except Exception as e:
             logger.error(f"Account summary request failed: {e}")
-            return {}
+            return None
 
     def get_open_positions(self, instrument: str = None) -> List[Dict[str, Any]]:
         """
@@ -161,10 +162,10 @@ class ExchangeConnector(BrokerInterface):
                 return positions
             else:
                 logger.error(f"Failed to fetch positions: {response.status_code} - {response.text}")
-                return []
+                return None # Changed from [] to None to distinguish failure from empty result
         except Exception as e:
             logger.error(f"Positions request failed: {e}")
-            return []
+            return None # Changed from [] to None to distinguish failure from empty result
 
     def get_trade_details(self, trade_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -221,7 +222,7 @@ class ExchangeConnector(BrokerInterface):
         try:
             # 1. Get current position details from the broker
             positions = self.get_open_positions()
-            target_pos = next((p for p in positions if p.get('tradeID') == trade_id), None)
+            target_pos = next((p for p in positions if trade_id in p.get('long', {}).get('tradeIDs', []) or trade_id in p.get('short', {}).get('tradeIDs', [])), None)
 
             if not target_pos:
                 logger.error(f"Close failed: Trade {trade_id} not found in open positions.")
@@ -231,9 +232,9 @@ class ExchangeConnector(BrokerInterface):
             # OANDA positions have 'long' and 'short' blocks.
             units = 0
             if target_pos.get('long', {}).get('units'):
-                units = -int(target_pos['long']['units']) # Close long with a sell
+                units = -int(float(target_pos['long']['units'])) # Close long with a sell
             elif target_pos.get('short', {}).get('units'):
-                units = -int(target_pos['short']['units']) # Close short with a buy
+                units = -int(float(target_pos['short']['units'])) # Close short with a buy
 
             if units == 0:
                 return {"status": "error", "message": "Could not determine units to close."}
@@ -278,14 +279,14 @@ class ExchangeConnector(BrokerInterface):
         try:
             # 1. Find the position to get current units and instrument
             positions = self.get_open_positions()
-            pos = next((p for p in positions if p.get('tradeID') == trade_id), None)
+            pos = next((p for p in positions if trade_id in p.get('long', {}).get('tradeIDs', []) or trade_id in p.get('short', {}).get('tradeIDs', [])), None)
             if not pos:
                 return {"status": "error", "message": "Position not found."}
 
             instrument = pos.get('instrument')
             # Sum total units (long or short)
-            units = int(pos.get('long', {}).get('units', 0)) if pos.get('long', {}).get('units') else \
-                    int(pos.get('short', {}).get('units', 0))
+            units = int(float(pos.get('long', {}).get('units', 0))) if pos.get('long', {}).get('units') else \
+                    int(float(pos.get('short', {}).get('units', 0)))
 
             # 2. Construct the OANDA update payload
             url = f"{self.base_url}/accounts/{self.account_id}/orders"
@@ -373,24 +374,23 @@ class ExchangeConnector(BrokerInterface):
 
     def get_trade_id_from_order(self, order_id: str) -> Optional[str]:
         """
-        Resolves a Trade ID from a given Order ID by checking transactions.
+        Resolves a Trade ID from a given Order ID by checking recent transactions.
+        The API filter by orderID can be unreliable for associated SL/TP events.
         """
-        url = f"{self.base_url}/accounts/{self.account_id}/transactions"
-        params = {"orderID": order_id}
         try:
-            response = requests.get(url, headers=self.headers, params=params, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                transactions = data.get('transactions', [])
-                for tx in transactions:
-                    if tx.get('type') == 'ORDER_FILL':
-                        # The fill transaction contains the tradeID
-                        return tx.get('tradeID')
+            from datetime import datetime, timedelta, timezone
+            from_time = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+            to_time = datetime.now(timezone.utc).isoformat()
+            transactions = self.get_account_transactions(from_time, to_time)
+            search_oid = str(order_id)
+            for tx in transactions:
+                tx_oid = str(tx.get('orderID', ''))
+                if tx_oid == search_oid and tx.get('tradeID'):
+                    return tx.get('tradeID')
             return None
         except Exception as e:
-            logger.error(f"Error resolving trade ID from order {order_id}: {e}")
+            logger.error(f'Error resolving trade ID from order {order_id}: {e}')
             return None
-
     def get_market_price(self, instrument: str) -> Dict[str, float]:
         """
         Fetches current Bid and Ask prices separately.

@@ -1,6 +1,11 @@
 import logging
 from typing import List, Tuple, Optional, Dict
 from datetime import datetime, time
+import math
+try:
+    import zoneinfo
+except ImportError:
+    from backports import zoneinfo
 
 logger = logging.getLogger(__name__)
 
@@ -12,18 +17,49 @@ class ComplianceGuard:
     def __init__(self,
                  max_intraday_drawdown: float = 150.0,
                  daily_loss_limit: float = 500.0,
-                 max_consecutive_losses: int = 3):
+                 max_consecutive_losses: int = 3,
+                 daily_reset_tz: str = "America/New_York",
+                 daily_reset_time: time = time(17, 0)):
         self.max_intraday_drawdown = max_intraday_drawdown
         self.daily_loss_limit = daily_loss_limit
         self.max_consecutive_losses = max_consecutive_losses
+        self.daily_reset_tz = daily_reset_tz
+        self.daily_reset_time = daily_reset_time
 
         # State tracking
         self.start_of_day_equity = None
         self.consecutive_losses = 0
         self.kill_switch_active = False
+        self._last_reset_date = None
+
+    def _should_reset_daily_stats(self) -> bool:
+        """Checks if the current time has passed the daily reset window in the target timezone."""
+        tz = zoneinfo.ZoneInfo(self.daily_reset_tz)
+        now_tz = datetime.now(tz)
+
+        # Today's reset point
+        today_reset = datetime.combine(now_tz.date(), self.daily_reset_time).replace(tzinfo=tz)
+
+        # If now is after today's reset, and we haven't reset today, or we are in a new calendar day
+        if now_tz >= today_reset:
+            # Reset if we haven't reset yet for this date
+            if self._last_reset_date != now_tz.date():
+                return True
+        return False
 
     def update_daily_start(self, equity: float):
         """Sets the equity benchmark for the start of the trading day."""
+        if equity is None or equity <= 0:
+            logger.warning(f"ComplianceGuard: Refusing to set daily benchmark to invalid value: {equity}")
+            return
+
+        # Handle automatic reset based on timezone/time
+        if self._should_reset_daily_stats():
+            tz = zoneinfo.ZoneInfo(self.daily_reset_tz)
+            now_tz = datetime.now(tz)
+            self._last_reset_date = now_tz.date()
+            logger.info(f"ComplianceGuard: Daily reset triggered ({self.daily_reset_tz} {self.daily_reset_time})")
+
         self.start_of_day_equity = equity
         self.consecutive_losses = 0
         self.kill_switch_active = False
@@ -36,6 +72,9 @@ class ComplianceGuard:
         """
         if self.kill_switch_active:
             return False, "Kill switch is already active. Trading disabled."
+
+        if current_equity is None or current_equity <= 0 or math.isnan(current_equity) or math.isinf(current_equity):
+            return False, "Invalid Account State: Equity unavailable or non-positive"
 
         if self.start_of_day_equity is None:
             return True, "Benchmark not yet set"
@@ -89,8 +128,31 @@ class SessionFilter:
 
     def is_trade_allowed(self) -> Tuple[bool, str]:
         """
-        Checks if the current UTC time falls within any allowed session.
+        Checks if the current UTC time falls within any allowed session
+        and ensures the market is open (not in weekend gap).
         """
+        # 1. Market Hours Check (NY Time)
+        try:
+            import zoneinfo
+        except ImportError:
+            from backports import zoneinfo
+
+        ny_tz = zoneinfo.ZoneInfo("America/New_York")
+        now_ny = datetime.now(ny_tz)
+        weekday = now_ny.weekday() # Mon=0, Sun=6
+        hour = now_ny.hour
+
+        # Friday after 17:00 NY
+        if weekday == 4 and hour >= 17:
+            return False, "Market closed for weekend (Friday 17:00 NY)"
+        # Saturday
+        if weekday == 5:
+            return False, "Market closed for weekend (Saturday)"
+        # Sunday before 17:00 NY
+        if weekday == 6 and hour < 17:
+            return False, "Market closed for weekend (Sunday < 17:00 NY)"
+
+        # 2. Session Filter Check (UTC)
         now = datetime.utcnow()
         current_time = now.time()
         current_day = now.weekday()

@@ -54,26 +54,31 @@ class StateManager:
         self.current_state["session_start_equity"] = equity
         self.save_state()
 
-    def reconcile_with_broker(self, broker_positions: List[Dict[str, Any]]):
+    def reconcile_with_broker(self, broker_positions: List[Dict[str, Any]]) -> Tuple[bool, str]:
         """
         Reconciles the internal state with actual broker positions.
         - Trades in state but NOT in broker -> Mark as CLOSED.
         - Trades in broker but NOT in state -> Add to state as 'IMPORTED'.
+        Returns (is_synchronized, mismatch_reason).
         """
         broker_trade_ids = [p.get('tradeID') for p in broker_positions if p.get('tradeID')]
         state_trade_ids = list(self.current_state["active_trades"].keys())
+
+        mismatches = []
 
         # 1. Handle trades that were closed on broker but are still in state
         for t_id in state_trade_ids:
             if t_id not in broker_trade_ids:
                 logger.info(f"Reconciliation: Trade {t_id} closed on broker. Removing from active state.")
                 self.remove_trade(t_id)
+                mismatches.append(f"Trade {t_id} was closed on broker")
 
         # 2. Handle trades that exist on broker but aren't in state
         for p in broker_positions:
             t_id = p.get('tradeID')
             if t_id and t_id not in self.current_state["active_trades"]:
                 logger.info(f"Reconciliation: Found untracked trade {t_id} on broker. Importing...")
+                mismatches.append(f"Untracked trade {t_id} found on broker")
 
                 # Create a basic DNA for the imported trade
                 instrument = p.get('instrument', 'Unknown')
@@ -92,3 +97,8 @@ class StateManager:
                     'is_imported': True
                 }
                 self.update_trade(t_id, imported_dna)
+
+        if mismatches:
+            return False, " | ".join(mismatches)
+
+        return True, "Synchronized"
