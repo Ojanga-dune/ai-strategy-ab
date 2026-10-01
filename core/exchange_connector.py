@@ -139,7 +139,31 @@ class ExchangeConnector(BrokerInterface):
             response = requests.get(url, headers=self.headers, timeout=10)
             if response.status_code == 200:
                 res = response.json()
-                return res.get('account', res)
+                account = res.get('account', res)
+
+                # Normalize OANDA's 'NAV' to 'equity'
+                nav = account.get('NAV')
+                balance = account.get('balance')
+
+                # Validate numeric values
+                try:
+                    equity = float(nav) if nav is not None else None
+                    balance = float(balance) if balance is not None else None
+                except (ValueError, TypeError):
+                    equity, balance = None, None
+
+                # Fail-Closed: If essential data is missing or invalid, return None to signify "Unavailable State"
+                if equity is None or balance is None or equity <= 0:
+                    logger.error(f"Account data invalid or missing (NAV: {nav}, Balance: {balance})")
+                    return None
+
+                return {
+                    "equity": equity,
+                    "balance": balance,
+                    "account_id": account.get('id'),
+                    "currency": account.get('currency'),
+                    "raw": account # Preserve raw data for others
+                }
             else:
                 logger.error(f"Failed to fetch account summary: {response.status_code} - {response.text}")
                 return None

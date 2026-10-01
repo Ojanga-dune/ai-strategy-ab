@@ -74,7 +74,7 @@ class ComplianceGuard:
             return False, "Kill switch is already active. Trading disabled."
 
         if current_equity is None or current_equity <= 0 or math.isnan(current_equity) or math.isinf(current_equity):
-            return False, "Invalid Account State: Equity unavailable or non-positive"
+            return True, "Invalid Account State: Equity unavailable or non-positive (New entries blocked, positions preserved)"
 
         if self.start_of_day_equity is None:
             return True, "Benchmark not yet set"

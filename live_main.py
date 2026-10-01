@@ -615,7 +615,7 @@ MONITORED_ASSETS = [
     {"symbol": "BTC_USD", "gran": "H1"},
     {"symbol": "NAS100_USD", "gran": "H1"},
 ]
-POLL_INTERVAL = 3600  # 1 hour (in seconds)
+POLL_INTERVAL = 30  # Temporarily shortened for smoke test (usually 3600)
 MAX_OPEN_POSITIONS = 1    # Maximum allowed open positions across all assets
 FREEZE_POST_MORTEM = True # If True, disables the evolutionary strategy cycle
 
@@ -629,8 +629,8 @@ def main():
 
     try:
         # Configuration is now handled by core.config.settings singleton
-        api_key = settings.api_key
-        account_id = settings.account_id
+        api_key = settings['api_key']
+        account_id = settings['account_id']
 
         if not api_key or not account_id:
             logger.error("Missing OANDA_API_KEY or OANDA_ACCOUNT_ID in environment variables.")
@@ -640,7 +640,7 @@ def main():
         logger.info("Initializing Autonomous Live Bot...")
         
         # Use absolute path for data directory from settings
-        data_dir = settings.data_dir
+        data_dir = settings['data_dir']
         data_dir.mkdir(parents=True, exist_ok=True)
         
         dl = DataLake(api_key=api_key, account_id=account_id)
@@ -740,19 +740,29 @@ def main():
     try:
         while True:
             summary = exchange.get_account_summary()
-            equity = float(summary.get('equity', 0))
-            balance = float(summary.get('balance', 0))
+            if summary is None:
+                logger.warning("Account summary unavailable. Skipping compliance and entries for this cycle.")
+                is_account_available = False
+                equity = None
+                balance = None
+            else:
+                equity = summary['equity']
+                balance = summary['balance']
+                is_account_available = True
 
             # Update daily benchmark and persist it to disk
-            compliance_guard.update_daily_start(equity)
-            tracker.save_equity_snapshot(equity)
+            if is_account_available:
+                compliance_guard.update_daily_start(equity)
+                tracker.save_equity_snapshot(equity)
 
             # Daily PnL = Current Total Equity - Equity at start of day
-            # This correctly handles balance changes and unrealized PnL
-            start_equity = tracker.load_equity_snapshot() or equity
-            current_pnl = equity - start_equity
+            start_equity = tracker.load_equity_snapshot()
+            if start_equity is None:
+                start_equity = equity if is_account_available else 0.0
 
-            is_compliant, reason = compliance_guard.check_compliance(equity, current_pnl)
+            current_pnl = (equity - start_equity) if is_account_available else 0.0
+
+            is_compliant, reason = compliance_guard.check_compliance(equity if is_account_available else None, current_pnl)
 
 
 
