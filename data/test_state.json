@@ -1,0 +1,8 @@
+{
+    "active_trades": {},
+    "last_cycle_timestamp": null,
+    "session_start_equity": null,
+    "heartbeat_pending": false,
+    "last_heartbeat_time": "2026-10-02T10:59:19.359323+00:00",
+    "heartbeat_due_at": "2026-10-02T14:59:19.359323+00:00"
+}

@@ -15,7 +15,60 @@
                 "wins": 0
             }
         },
-        "challengers": []
+        "challengers": [
+            {
+                "version": "strat_6548",
+                "instrument": "XAU_USD",
+                "granularity": "H1",
+                "rules": {
+                    "trigger": "bullish_engulfing",
+                    "filters": [
+                        {
+                            "indicator": "RSI",
+                            "operator": "<",
+                            "value": 70
+                        },
+                        {
+                            "indicator": "SMA_200",
+                            "operator": ">",
+                            "value": 0
+                        }
+                    ]
+                },
+                "performance": {
+                    "win_rate": 0.0,
+                    "total_trades": 0,
+                    "pnl": 0.0,
+                    "wins": 0
+                }
+            },
+            {
+                "version": "strat_2457",
+                "instrument": "XAU_USD",
+                "granularity": "H1",
+                "rules": {
+                    "trigger": "inside_bar",
+                    "filters": [
+                        {
+                            "indicator": "RSI",
+                            "operator": "<",
+                            "value": 70
+                        },
+                        {
+                            "indicator": "SMA_200",
+                            "operator": ">",
+                            "value": 0
+                        }
+                    ]
+                },
+                "performance": {
+                    "win_rate": 0.0,
+                    "total_trades": 0,
+                    "pnl": 0.0,
+                    "wins": 0
+                }
+            }
+        ]
     },
     "BTC_USD": {
         "champion": {
@@ -33,7 +86,60 @@
                 "wins": 0
             }
         },
-        "challengers": []
+        "challengers": [
+            {
+                "version": "strat_8831",
+                "instrument": "BTC_USD",
+                "granularity": "H1",
+                "rules": {
+                    "trigger": "inside_bar",
+                    "filters": [
+                        {
+                            "indicator": "RSI",
+                            "operator": "<",
+                            "value": 30
+                        },
+                        {
+                            "indicator": "SMA_200",
+                            "operator": ">",
+                            "value": 0
+                        }
+                    ]
+                },
+                "performance": {
+                    "win_rate": 0.0,
+                    "total_trades": 0,
+                    "pnl": 0.0,
+                    "wins": 0
+                }
+            },
+            {
+                "version": "strat_9451",
+                "instrument": "BTC_USD",
+                "granularity": "H1",
+                "rules": {
+                    "trigger": "pin_bar",
+                    "filters": [
+                        {
+                            "indicator": "RSI",
+                            "operator": "<",
+                            "value": 70
+                        },
+                        {
+                            "indicator": "SMA_200",
+                            "operator": ">",
+                            "value": 0
+                        }
+                    ]
+                },
+                "performance": {
+                    "win_rate": 0.0,
+                    "total_trades": 0,
+                    "pnl": 0.0,
+                    "wins": 0
+                }
+            }
+        ]
     },
     "NAS100_USD": {
         "champion": {
@@ -51,6 +157,59 @@
                 "wins": 0
             }
         },
-        "challengers": []
+        "challengers": [
+            {
+                "version": "strat_9201",
+                "instrument": "NAS100_USD",
+                "granularity": "H1",
+                "rules": {
+                    "trigger": "inside_bar",
+                    "filters": [
+                        {
+                            "indicator": "RSI",
+                            "operator": "<",
+                            "value": 30
+                        },
+                        {
+                            "indicator": "SMA_200",
+                            "operator": ">",
+                            "value": 0
+                        }
+                    ]
+                },
+                "performance": {
+                    "win_rate": 0.0,
+                    "total_trades": 0,
+                    "pnl": 0.0,
+                    "wins": 0
+                }
+            },
+            {
+                "version": "strat_1313",
+                "instrument": "NAS100_USD",
+                "granularity": "H1",
+                "rules": {
+                    "trigger": "bullish_engulfing",
+                    "filters": [
+                        {
+                            "indicator": "RSI",
+                            "operator": "<",
+                            "value": 70
+                        },
+                        {
+                            "indicator": "SMA_200",
+                            "operator": ">",
+                            "value": 0
+                        }
+                    ]
+                },
+                "performance": {
+                    "win_rate": 0.0,
+                    "total_trades": 0,
+                    "pnl": 0.0,
+                    "wins": 0
+                }
+            }
+        ]
     }
 }

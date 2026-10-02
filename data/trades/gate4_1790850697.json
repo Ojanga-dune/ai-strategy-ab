@@ -1,0 +1,15 @@
+{
+    "instrument": "XAU_USD",
+    "side": "BUY",
+    "units": 1,
+    "entry_price": 4168.7,
+    "order_id": "275",
+    "trade_id": "276",
+    "status": "CLOSED",
+    "client_id": "gate4_test_1790850697",
+    "is_simulated": false,
+    "recorded_at": "2026-10-01T10:31:37.786778",
+    "pnl": -0.4125,
+    "pnl_source": "oanda",
+    "closed_at": "2026-10-01T13:44:35.216095"
+}

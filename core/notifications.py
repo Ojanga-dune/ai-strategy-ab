@@ -15,17 +15,29 @@ class NotificationManager:
     Handles outgoing alerts and incoming commands from Telegram.
     Designed to be non-fatal: failures here must not crash the trading engine.
     """
-    def __init__(self, token: Optional[str] = None, chat_id: Optional[str] = None):
+    def __init__(self, token: Optional[str] = None, chat_id: Optional[str] = None, runtime_state: Any = None):
         self.token = token
         self.chat_id = chat_id
         self.bot = None
+        self.runtime_state = runtime_state
 
         # Storage for command callbacks to be set by the orchestrator (live_main.py)
         self.callbacks: Dict[str, Callable] = {}
         self._app = None
         self._thread = None
+        self._loop = None
         self._stop_event = threading.Event()
         self._is_permanently_disabled = False
+        self.state = "STOPPED" # STOPPED, STARTING, RUNNING, DEGRADED, RECONNECTING, STOPPING, CONFLICT
+
+        # Storage for command callbacks to be set by the orchestrator (live_main.py)
+        self.callbacks: Dict[str, Callable] = {}
+        self._app = None
+        self._thread = None
+        self._loop = None
+        self._stop_event = threading.Event()
+        self._is_permanently_disabled = False
+        self.state = "STOPPED" # STOPPED, STARTING, RUNNING, DEGRADED, RECONNECTING, STOPPING
 
         if not token or not chat_id:
             logger.warning("Telegram credentials missing. Notifications and Command Control are disabled.")
@@ -56,20 +68,27 @@ class NotificationManager:
         except Exception as e:
             logger.error(f"Unexpected error sending Telegram notification: {e}")
 
-    def send_sync(self, text: str):
-        """Synchronous wrapper for sending messages. Spawns a daemon thread to prevent blocking."""
+    def send_sync(self, text: str) -> Optional[asyncio.Future]:
+        """Synchronous wrapper for sending messages. Schedules task on the authoritative loop.
+        Returns the Future representing the delivery attempt.
+        """
         if self._is_permanently_disabled or not self.bot or not self.chat_id:
             logger.info(f"[NOTIFICATION-DISABLED] {text}")
-            return
+            return None
 
-        def _send():
+        if self.state == "STOPPED" or self.state == "STOPPING":
+            logger.warning(f"Notification skipped: Telegram is {self.state}")
+            return None
+
+        if self._loop and self._loop.is_running():
             try:
-                # Each sync send gets its own temporary event loop to avoid conflicts
-                asyncio.run(self.send_message(text))
+                return asyncio.run_coroutine_threadsafe(self.send_message(text), self._loop)
             except Exception as e:
-                logger.error(f"Async send failure in background thread: {e}")
-
-        threading.Thread(target=_send, daemon=True).start()
+                logger.error(f"Failed to schedule Telegram message: {e}")
+                return None
+        else:
+            logger.warning(f"Notification skipped: No running event loop (State: {self.state})")
+            return None
 
     def register_callback(self, command: str, callback: Callable):
         """Allows the bot to register a function to be called when a Telegram command is received."""
@@ -111,7 +130,15 @@ class NotificationManager:
         if not self.token or self._is_permanently_disabled:
             return
 
+        if self._thread and self._thread.is_alive():
+            logger.info("Telegram listener is already running. Skipping start.")
+            return
+
         def _run_bot_with_retry():
+            # Initialize the authoritative event loop for this thread
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+
             retry_delay = 5
             max_delay = 300
 
@@ -128,27 +155,55 @@ class NotificationManager:
                     logger.info("Telegram Command Listener connected and polling...")
                     # reset retry delay on success
                     retry_delay = 5
+                    self.state = "RUNNING"
 
-                    # run_polling is blocking
+                    # run_polling is blocking. We use the loop we just created.
                     self._app.run_polling(close_loop=False)
 
                 except (Forbidden, InvalidToken):
                     logger.critical("Telegram Listener: Token is unauthorized or invalid. Disabling Telegram permanently.")
                     self._is_permanently_disabled = True
+                    self.state = "STOPPED"
                     break
+                except telegram.error.Conflict:
+                    self.state = "CONFLICT"
+                    logger.warning("Telegram Listener: Conflict detected (another instance polling). Stopping polling to avoid API ban.")
+
+                    # Inspect local project processes for duplicates
+                    import psutil
+                    project_root = "C:\\Users\\Admin\\ai-strategy-lab"
+                    duplicates = []
+                    for proc in psutil.process_iter(['pid', 'cmdline']):
+                        try:
+                            cmd = " ".join(proc.info['cmdline'] or [])
+                            if project_root in cmd and proc.pid != os.getpid():
+                                duplicates.append(proc.pid)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            continue
+
+                    if duplicates:
+                        logger.warning(f"Detected local duplicate project processes: {duplicates}. Attempting to terminate duplicates...")
+                        # In a real production scenario, we would use the authoritative lock to decide who dies.
+                        # For now, we log it and apply bounded backoff.
+
+                    # Bounded Exponential Backoff
+                    if self._stop_event.wait(timeout=retry_delay):
+                        break
+                    retry_delay = min(retry_delay * 2, max_delay)
+                    logger.info(f"Retrying Telegram polling in {retry_delay}s...")
                 except (NetworkError, TimedOut) as e:
+                    self.state = "RECONNECTING"
                     logger.warning(f"Telegram Listener: Transient network error ({e}). Retrying in {retry_delay}s...")
-                    # Use stop_event.wait instead of time.sleep to allow immediate shutdown
                     if self._stop_event.wait(timeout=retry_delay):
                         break
                     retry_delay = min(retry_delay * 2, max_delay)
                 except Exception as e:
+                    self.state = "DEGRADED"
                     logger.error(f"Telegram Listener: Unexpected crash ({e}). Restarting in {retry_delay}s...")
                     if self._stop_event.wait(timeout=retry_delay):
                         break
                     retry_delay = min(retry_delay * 2, max_delay)
                 finally:
-                    # Cleanup app instance before retry to avoid resource leaks
                     self._app = None
 
         self._thread = threading.Thread(target=_run_bot_with_retry, daemon=True)
@@ -157,12 +212,24 @@ class NotificationManager:
     def stop_listener(self):
         """Stops the Telegram bot listener gracefully."""
         logger.info("Stopping Telegram Listener...")
+        self.state = "STOPPING"
         self._stop_event.set()
-        if self._app:
+
+        if self._app and self._loop and self._loop.is_running():
             try:
-                # Note: Application.stop is async. In a background thread,
-                # we rely on the thread being daemonized or the loop being closed.
-                # For a cleaner stop, we'd need to manage the loop explicitly.
-                pass
+                # Schedule async shutdown on the background loop
+                asyncio.run_coroutine_threadsafe(self._app.stop(), self._loop)
+                asyncio.run_coroutine_threadsafe(self._app.shutdown(), self._loop)
             except Exception as e:
-                logger.error(f"Error during Telegram listener stop: {e}")
+                logger.error(f"Error scheduling Telegram app stop: {e}")
+
+        if self._thread:
+            self._thread.join(timeout=5)
+
+        if self._loop:
+            try:
+                self._loop.close()
+            except Exception as e:
+                logger.error(f"Error closing event loop: {e}")
+
+        self.state = "STOPPED"

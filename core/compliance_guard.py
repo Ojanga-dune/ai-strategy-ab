@@ -104,6 +104,20 @@ class ComplianceGuard:
             self.consecutive_losses += 1
             logger.warning(f"ComplianceGuard: Consecutive losses increased to {self.consecutive_losses}")
 
+    def get_status_summary(self, current_equity: Optional[float], current_pnl: float) -> str:
+        """Returns a human-readable compliance status for the /status command."""
+        is_compliant, reason = self.check_compliance(current_equity, current_pnl)
+
+        if not is_compliant:
+            if "HARD STOP" in reason:
+                return f"Compliance: HARD STOP ❌ ({reason})"
+            return f"Compliance: ENTRY BLOCKED ⚠️ ({reason})"
+
+        if "Invalid Account State" in reason:
+            return f"Compliance: ENTRY BLOCKED ⚠️ ({reason})"
+
+        return "Compliance: OK ✅"
+
 class SessionFilter:
     """
     Enforces trading window restrictions.

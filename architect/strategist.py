@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import anthropic
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,10 +17,11 @@ class StrategistAgent:
     Generates new trading strategy JSONs based on market regimes, 'Lessons Learned',
     and quantitative backtest performance.
     """
-    def __init__(self, lessons_file: str = "data/lessons_learned.txt", backtester: Any = None):
+    def __init__(self, lessons_file: str = "data/lessons_learned.txt", backtester: Any = None, runtime_state: Any = None):
         self.lessons_file = Path(lessons_file)
         self.client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         self.backtester = backtester
+        self.runtime_state = runtime_state
 
     def _get_lessons(self) -> List[str]:
         if not self.lessons_file.exists():
@@ -28,7 +30,18 @@ class StrategistAgent:
             return [line.strip() for line in f.readlines() if line.strip()]
 
     def _call_llm(self, prompt: str) -> Optional[Dict[str, Any]]:
-        """Helper to call LLM and parse JSON response."""
+        """Helper to call LLM and parse JSON response. Implements circuit breaker for degraded state."""
+        # 1. Circuit Breaker Check
+        if self.runtime_state:
+            if self.runtime_state.research_engine_status == "DEGRADED":
+                last_fail = self.runtime_state.last_research_failure_time
+                if last_fail:
+                    # Cooldown: 1 hour
+                    elapsed = (datetime.now(timezone.utc) - last_fail).total_seconds()
+                    if elapsed < 3600:
+                        logger.info(f"Strategist: Research Engine is DEGRADED. Skipping API call (cooldown: {int(3600 - elapsed)}s remaining).")
+                        return None
+
         try:
             message = self.client.messages.create(
                 model="claude-3-5-sonnet-20240620",
@@ -46,6 +59,11 @@ class StrategistAgent:
             return json.loads(content)
         except Exception as e:
             logger.error(f"Strategist LLM Error: {e}")
+            # 2. Trigger Degraded State
+            if self.runtime_state:
+                self.runtime_state.research_engine_status = "DEGRADED"
+                self.runtime_state.last_research_failure_time = datetime.now(timezone.utc)
+                logger.warning("Strategist: Research Engine set to DEGRADED due to API failure.")
             return None
 
     def generate_new_strategy(self, instrument: str, granularity: str) -> Dict[str, Any]:

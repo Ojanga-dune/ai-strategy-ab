@@ -1,7 +1,7 @@
-import time
+﻿import time
 import logging
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from typing import Optional
 
@@ -185,7 +185,7 @@ def monitor_trade_outcomes(exchange: ExchangeConnector, tracker: TradeTracker, n
                 logger.info(f"Shadow Trade {t_local_id} virtually closed ({reason}). PnL: {pnl:.3f}")
                 tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": pnl, "pnl_source": "estimated", "reason": reason})
                 registry.update_performance(instrument, strat_version, pnl, pnl > 0, pnl_source="estimated")
-                notifier.send_sync(f"👻 Shadow Trade {strat_version} closed: {reason} (PnL: {pnl:.3f})")
+                notifier.send_sync(f"ðŸ‘» Shadow Trade {strat_version} closed: {reason} (PnL: {pnl:.3f})")
             continue
 
         # --- Live Trade Handling ---
@@ -221,7 +221,7 @@ def monitor_trade_outcomes(exchange: ExchangeConnector, tracker: TradeTracker, n
         realized_pnl = resolve_trade_pnl(exchange, t_trade_id)
         if realized_pnl is not None:
             tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": realized_pnl, "pnl_source": "oanda"})
-            notifier.send_sync(f"🏁 Trade Closed: {t_trade_id}. PnL: {realized_pnl:.2f}")
+            notifier.send_sync(f"ðŸ Trade Closed: {t_trade_id}. PnL: {realized_pnl:.2f}")
         else:
             logger.warning(f"Trade {t_trade_id} closure confirmed, but PnL resolution failed. Retrying next cycle.")
 
@@ -442,11 +442,11 @@ def run_live_cycle(
                     # Record rejection in circuit breaker
                     tripped, reason = circuit_breaker.record_rejection()
                     if tripped:
-                        notifier.send_sync(f"🚨 **CIRCUIT BREAKER TRIPPED**\n{reason}\nTrading halted for this account.")
+                        notifier.send_sync(f"ðŸš¨ **CIRCUIT BREAKER TRIPPED**\n{reason}\nTrading halted for this account.")
                         logger.critical(reason)
 
                     try:
-                        notifier.send_sync(f"🚨 **Order Rejected**\nInstrument: {instrument}\nStatus: {error_status}\nError: {result.get('message', 'Unknown error') if result else 'Network Error'}")
+                        notifier.send_sync(f"ðŸš¨ **Order Rejected**\nInstrument: {instrument}\nStatus: {error_status}\nError: {result.get('message', 'Unknown error') if result else 'Network Error'}")
                     except Exception as e:
                         logger.error(f"Failed to send Telegram alert for rejected order: {e}")
 
@@ -480,7 +480,7 @@ def run_live_cycle(
 
                 if 'orderCancelTransaction' in result:
                     cancel_reason = result['orderCancelTransaction'].get('reason', 'Unknown')
-                    error_msg = f"❌ Trade Cancelled: {cancel_reason}\n\n💡 How to fix: This usually happens if the market is halted or the order was too large for current liquidity. Try reducing risk or check OANDA server status."
+                    error_msg = f"âŒ Trade Cancelled: {cancel_reason}\n\nðŸ’¡ How to fix: This usually happens if the market is halted or the order was too large for current liquidity. Try reducing risk or check OANDA server status."
                     notifier.send_sync(error_msg)
                     if 'orderCreateTransaction' in result:
                         order_id = result['orderCreateTransaction']['id']
@@ -488,16 +488,16 @@ def run_live_cycle(
                         local_id = f"trade_{int(time.time())}_{order_id}"
                         tracker.update_outcome(local_id, {"status": "CLOSED", "pnl": 0, "reason": "Cancelled"})
                 elif result.get('status') == 'error':
-                    error_msg = f"❌ Order Error: {result.get('message')}\n\n💡 Details: {result.get('raw')}"
+                    error_msg = f"âŒ Order Error: {result.get('message')}\n\nðŸ’¡ Details: {result.get('raw')}"
                     notifier.send_sync(error_msg)
                     if 'orderCreateTransaction' in result:
                         order_id = result['orderCreateTransaction']['id']
                         local_id = f"trade_{int(time.time())}_{order_id}"
                         tracker.update_outcome(local_id, {"status": "CLOSED", "pnl": 0, "reason": "Cancelled"})
                 elif result.get('status') == 'success' or 'orderCreateTransaction' in result:
-                    dir_text = "LONG 📈" if side_lots > 0 else "SHORT 📉"
+                    dir_text = "LONG ðŸ“ˆ" if side_lots > 0 else "SHORT ðŸ“‰"
                     exec_msg = (
-                        f"✅ Champion {strat_version} executed {dir_text}!\n"
+                        f"âœ… Champion {strat_version} executed {dir_text}!\n"
                         f"Instrument: {instrument}\n"
                         f"Entry: {latest_trade['price']:.3f}\n"
                         f"TP: {tp_price:.3f}\n"
@@ -506,7 +506,7 @@ def run_live_cycle(
                     )
                     notifier.send_sync(exec_msg)
                 else:
-                    fail_msg = "❌ Champion failed execution.\n\n💡 How to fix: Check if your API key is still valid or if you have enough margin for this trade size."
+                    fail_msg = "âŒ Champion failed execution.\n\nðŸ’¡ How to fix: Check if your API key is still valid or if you have enough margin for this trade size."
                     notifier.send_sync(fail_msg)
             else:
                 logger.info(f"Challenger ({strat_version}) approved a trade. Recording in Shadow Mode...")
@@ -539,13 +539,13 @@ def cmd_positions(text, context, exchange):
     positions = exchange.get_open_positions()
     if not positions:
         return "No open positions."
-    msg = "📈 **Open Positions**\n\n"
+    msg = "ðŸ“ˆ **Open Positions**\n\n"
     for p in positions:
         inst = p.get('instrument', 'Unknown')
         units = p.get('long', {}).get('units', 0) if p.get('long', {}).get('units') != '0' else p.get('short', {}).get('units', 0)
         pl = p.get('unrealizedPL', '0.0')
         avg_price = p.get('long', {}).get('averagePrice', p.get('short', {}).get('averagePrice', 'N/A'))
-        msg += f"🔸 {inst} | Units: {units} | Price: {avg_price} | PnL: ${pl}\n"
+        msg += f"ðŸ”¸ {inst} | Units: {units} | Price: {avg_price} | PnL: ${pl}\n"
     return msg
 
 def cmd_close_all(text, context, exchange):
@@ -557,24 +557,24 @@ def cmd_close_all(text, context, exchange):
         units = float(p.get('long', {}).get('units', 0)) - float(p.get('short', {}).get('units', 0))
         if units != 0:
             exchange.place_market_order(inst, -units)
-    return "✅ Sent close orders for all positions."
+    return "âœ… Sent close orders for all positions."
 
 def cmd_close_partial(text, context, exchange):
     try:
         parts = text.split()
         if len(parts) < 3:
-            return "❌ Usage: /close_partial <instrument> <units> (e.g., /close_partial XAU_USD 50)"
+            return "âŒ Usage: /close_partial <instrument> <units> (e.g., /close_partial XAU_USD 50)"
         instrument = parts[1]
         units_to_close = int(parts[2])
         result = exchange.place_market_order(instrument, -units_to_close)
         if 'orderCreateTransaction' in result:
-            return f"✅ Partially closed {abs(units_to_close)} units of {instrument}."
-        return f"❌ Failed to partial close: {result.get('message', 'Unknown error')}"
+            return f"âœ… Partially closed {abs(units_to_close)} units of {instrument}."
+        return f"âŒ Failed to partial close: {result.get('message', 'Unknown error')}"
     except Exception as e:
-        return f"❌ Error: {str(e)}"
+        return f"âŒ Error: {str(e)}"
 
 def cmd_move_be(text, context):
-    return "🛠️ Move to Break Even is automated in the loop. Manual trigger not available."
+    return "ðŸ› ï¸ Move to Break Even is automated in the loop. Manual trigger not available."
 
 def cmd_daily(text, context, tracker, registry):
     all_trades = tracker.get_all_trades()
@@ -589,15 +589,15 @@ def cmd_daily(text, context, tracker, registry):
         avg_pnl = (total_pnl / total_trades) if total_trades > 0 else 0
         rr = champ.get('metadata', {}).get('risk_reward', 'TBD')
         champ_stats = (
-            f"🏆 **Champion (XAU_USD): {champ['version']}**\n"
+            f"ðŸ† **Champion (XAU_USD): {champ['version']}**\n"
             f"Avg PnL: ${avg_pnl:.2f}\n"
             f"Win Rate: {win_rate}\n"
             f"RR Ratio: {rr}"
         )
     if "status" in stats:
-        return f"📊 **Daily Report**\n\n{stats['status']}\n\n{champ_stats}"
+        return f"ðŸ“Š **Daily Report**\n\n{stats['status']}\n\n{champ_stats}"
     msg = (
-        f"📊 **Daily Performance Report**\n"
+        f"ðŸ“Š **Daily Performance Report**\n"
         f"Date: {stats.get('date', 'N/A')}\n"
         f"----------------------------\n"
         f"Total PnL: ${stats.get('total_pnl', 0):.2f}\n"
@@ -608,12 +608,8 @@ def cmd_daily(text, context, tracker, registry):
     )
     return msg
 
-def cmd_status(text, context, exchange, runtime, compliance, tracker, breaker, notifier):
+def cmd_status(text, context, exchange, runtime, compliance, tracker, breaker):
     """Read-only bot health dashboard."""
-    # Verify authoritative state identity
-    # If we are in a test/dev environment, we can assert id(runtime) is consistent
-    # In production, this ensures callbacks are using the same instance as the main loop.
-
     # 1. Basic Health
     uptime = runtime.get_uptime_str()
     cycles = runtime.cycle_count
@@ -624,7 +620,6 @@ def cmd_status(text, context, exchange, runtime, compliance, tracker, breaker, n
     conn_status = getattr(exchange, 'connection_status', 'UNKNOWN')
     env = settings.get('oanda_env', 'unknown')
     sim_mode = settings.get('simulation_mode', False)
-    telegram_status = notifier.state
 
     # 3. Account & Compliance
     summary = exchange.get_account_summary()
@@ -640,28 +635,23 @@ def cmd_status(text, context, exchange, runtime, compliance, tracker, breaker, n
     trade_count = len(open_trades)
 
     # 5. Safety & Recovery
-    breaker_status = "TRIPPED 🚨" if breaker.is_tripped() else "OK ✅"
+    breaker_status = "TRIPPED ðŸš¨" if breaker.is_tripped() else "OK âœ…"
     breaker_reason = breaker.last_reason if breaker.is_tripped() else "N/A"
-
-    # Use state_manager for authoritative boot count
-    from core.state_manager import StateManager
-    sm = StateManager()
-    boot_count = sm.get_boot_count()
+    boot_count = settings.get('boot_count', 0) # This should be from state_manager
 
     # 6. Recent Errors
     errors = list(runtime.error_buffer)
     error_msg = "\n".join(errors) if errors else "None"
 
     report = (
-        f"🤖 **Bot Health Status**\n"
+        f"ðŸ¤– **Bot Health Status**\n"
         f"----------------------------\n"
-        f"Status: RUNNING ✅\n"
+        f"Status: RUNNING âœ…\n"
         f"Uptime: {uptime}\n"
         f"Cycles: {cycles} (Last: {last_cycle_str})\n"
         f"Bot Starts: {boot_count}\n"
         f"----------------------------\n"
         f"OANDA: {conn_status} ({env})\n"
-        f"Telegram: {telegram_status}\n"
         f"Simulation: {'Yes' if sim_mode else 'No'}\n"
         f"Equity: ${equity if equity else 'N/A'}\n"
         f"Compliance: {comp_status}\n"
@@ -699,29 +689,16 @@ def main():
                 content = f.read().strip()
 
             if content:
-                # Expected format: launcher_pid|child_pid|started_at|project_path|session_uuid
+                # Expecting launcher_pid|child_pid|started_at
                 parts = content.split('|')
-                if len(parts) >= 5:
+                if len(parts) >= 1:
                     launcher_pid = int(parts[0])
-                    session_uuid = parts[4]
-
-                    # Verify launcher is actually alive and is the authoritative one
                     import psutil
                     if psutil.pid_exists(launcher_pid):
-                        # Validate that the process is actually a powershell/cmd process
-                        # and not a random reused PID
-                        try:
-                            proc = psutil.Process(launcher_pid)
-                            cmdline = " ".join(proc.cmdline())
-                            if "run_bot.ps1" in cmdline:
-                                if not is_managed:
-                                    logger.error(f"Managed bot instance already running (Launcher PID: {launcher_pid}). Manual launch refused.")
-                                    return
-                                # If is_managed is True, the launcher is our parent; we are allowed to start.
-                        except (psutil.NoSuchProcess, psutil.AccessDenied):
-                            pass
-                else:
-                    logger.warning("Lock file found but format is invalid. Relying on launcher for cleanup.")
+                        if not is_managed:
+                            logger.error("Managed bot instance already running. Manual launch refused.")
+                            return
+                        # If is_managed is True, the launcher is our parent; we are allowed to start.
         except (ValueError, OSError) as e:
             logger.debug(f"Could not parse launcher lock: {e}")
 
@@ -787,8 +764,7 @@ def main():
 
         notifier = NotificationManager(
             token=os.getenv("TELEGRAM_API_KEY"),
-            chat_id=os.getenv("TELEGRAM_CHAT_ID"),
-            runtime_state=runtime_state
+            chat_id=os.getenv("TELEGRAM_CHAT_ID")
         )
 
         # Safety Interlock: Force practice mode unless explicitly enabled
@@ -835,7 +811,7 @@ def main():
         notifier.register_callback('close_partial', lambda t, c: cmd_close_partial(t, c, exchange))
         notifier.register_callback('move_be', cmd_move_be)
         notifier.register_callback('daily', lambda t, c: cmd_daily(t, c, tracker, registry))
-        notifier.register_callback('status', lambda t, c: cmd_status(t, c, exchange, runtime_state, compliance_guard, tracker, circuit_breaker, notifier))
+        notifier.register_callback('status', lambda t, c: cmd_status(t, c, exchange, runtime_state, compliance_guard, tracker, circuit_breaker))
         notifier.register_callback('message', portfolio_manager.handle_response)
 
         logger.info("Performing State Recovery/Reconciliation...")
@@ -843,7 +819,7 @@ def main():
         synced, mismatch_msg = state_manager.reconcile_with_broker(broker_positions)
 
         if not synced:
-            alert_msg = f"⚠️ STARTUP MISMATCH: Broker and State are out of sync!\nDetails: {mismatch_msg}\n\nAction: Bot will continue, but please review active trades."
+            alert_msg = f"âš ï¸ STARTUP MISMATCH: Broker and State are out of sync!\nDetails: {mismatch_msg}\n\nAction: Bot will continue, but please review active trades."
             logger.warning(alert_msg)
             notifier.send_sync(alert_msg)
         else:
@@ -862,11 +838,6 @@ def main():
 
     try:
         while True:
-            # --- OANDA Auth Recovery ---
-            if exchange.connection_status == "AUTH_FAILED":
-                logger.warning("Broker auth failed. Triggering recovery flow...")
-                exchange.handle_auth_recovery(state_manager)
-
             summary = exchange.get_account_summary()
             if summary is None:
                 logger.warning("Account summary unavailable. Skipping compliance and entries for this cycle.")
@@ -896,7 +867,7 @@ def main():
 
 
             if not is_compliant:
-                error_msg = f"🚨 COMPLIANCE VIOLATION: {reason}\n\nExecuting Emergency Shutdown..."
+                error_msg = f"ðŸš¨ COMPLIANCE VIOLATION: {reason}\n\nExecuting Emergency Shutdown..."
                 notifier.send_sync(error_msg)
                 logger.critical(error_msg)
                 # Emergency close all
@@ -910,108 +881,21 @@ def main():
 
             # --- Heartbeat Logic ---
             now_utc = datetime.now(timezone.utc)
+            if runtime_state.last_heartbeat_time is None or \
+               (now_utc - runtime_state.last_heartbeat_time).total_seconds() >= 14400:
 
-            # Use configurable heartbeat interval with a safe default
-            heartbeat_interval = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", 14400))
-
-            # 1. Process In-Flight Heartbeat Result
-            if runtime_state.heartbeat_in_flight:
-                # We track the Future and a deadline
-                # The Future is stored in a variable outside the loop or in runtime_state
-                # Since we are in a loop, we need a way to reference the last sent Future.
-                # Let's assume we added 'current_heartbeat_future' to runtime_state.
-                pass
-
-            # Check for recovery notification first
-            if runtime_state.heartbeat_pending and notifier.state == "RUNNING" and not runtime_state.heartbeat_in_flight:
-                # Mark as in-flight to prevent duplicate recovery messages
-                runtime_state.heartbeat_in_flight = True
-                runtime_state.heartbeat_attempt_id += 1
-                current_attempt = runtime_state.heartbeat_attempt_id
-
-                offline_duration = "unknown"
-                if runtime_state.last_heartbeat_time:
-                    diff = now_utc - runtime_state.last_heartbeat_time
-                    offline_duration = f"{diff.total_seconds()/3600:.1f}h"
-
-                recovery_msg = (
-                    f"♻️ **Connectivity Restored**\n"
-                    f"Offline duration: ~{offline_duration}\n"
-                    f"Cycles caught up: {runtime_state.cycle_count}\n"
-                    f"Bot state: RUNNING ✅"
+                # Generate concise health report for heartbeat
+                heartbeat_msg = (
+                    f"ðŸ’“ **Bot Heartbeat**\n"
+                    f"Uptime: {runtime_state.get_uptime_str()}\n"
+                    f"Cycles: {runtime_state.cycle_count}\n"
+                    f"Compliance: {compliance_guard.get_status_summary(equity if is_account_available else None, current_pnl)}\n"
+                    f"Trades: {len(tracker.get_open_trades())} open\n"
+                    f"Env: {settings.get('oanda_env', 'unknown')} | Sim: {settings.get('simulation_mode', False)}"
                 )
-
-                # Non-blocking dispatch
-                future = notifier.send_sync(recovery_msg)
-                if future:
-                    runtime_state.current_heartbeat_future = future
-                    runtime_state.heartbeat_send_deadline = now_utc + timedelta(seconds=30)
-                    # We only clear pending upon SUCCESS of this future
-                else:
-                    # Immediate failure
-                    runtime_state.heartbeat_in_flight = False
-                    logger.warning("Recovery message failed to schedule.")
-
-            # Trigger heartbeat if due or first run
-            if (runtime_state.last_heartbeat_time is None or
-                (runtime_state.heartbeat_due_at and now_utc >= runtime_state.heartbeat_due_at) or
-                (runtime_state.next_retry_at and now_utc >= runtime_state.next_retry_at) or
-                (not runtime_state.heartbeat_due_at and not runtime_state.next_retry_at and
-                 (now_utc - runtime_state.last_heartbeat_time).total_seconds() >= heartbeat_interval if runtime_state.last_heartbeat_time else True)):
-
-                if runtime_state.heartbeat_in_flight:
-                    # Check for timeout
-                    if runtime_state.heartbeat_send_deadline and now_utc > runtime_state.heartbeat_send_deadline:
-                        logger.warning("Heartbeat send deadline exceeded. Marking as failed.")
-                        runtime_state.heartbeat_in_flight = False
-                        runtime_state.heartbeat_pending = True
-                    else:
-                        continue
-
-                runtime_state.heartbeat_in_flight = True
-                runtime_state.heartbeat_attempt_id += 1
-                current_attempt = runtime_state.heartbeat_attempt_id
-
-                try:
-                    # Generate concise health report for heartbeat
-                    heartbeat_msg = (
-                        f"💓 **Bot Heartbeat**\n"
-                        f"Uptime: {runtime_state.get_uptime_str()}\n"
-                        f"Cycles: {runtime_state.cycle_count}\n"
-                        f"Compliance: {compliance_guard.get_status_summary(equity if is_account_available else None, current_pnl)}\n"
-                        f"Trades: {len(tracker.get_open_trades())} open\n"
-                        f"Env: {settings.get('oanda_env', 'unknown')} | Sim: {settings.get('simulation_mode', False)}"
-                    )
-
-                    if notifier.state == "RUNNING":
-                        future = notifier.send_sync(heartbeat_msg)
-                        if future:
-                            runtime_state.current_heartbeat_future = future
-                            runtime_state.heartbeat_send_deadline = now_utc + timedelta(seconds=30)
-                            logger.info(f"Heartbeat {current_attempt} dispatched. Awaiting confirmation...")
-                        else:
-                            raise Exception("Failed to schedule Future")
-                    else:
-                        logger.warning(f"Heartbeat skipped: Notifier is {notifier.state}. Marking as pending.")
-                        runtime_state.heartbeat_pending = True
-                        runtime_state.heartbeat_in_flight = False
-                        # Schedule retry
-                        runtime_state.heartbeat_retry_count += 1
-                        backoff = [30, 60, 120, 300][min(runtime_state.heartbeat_retry_count-1, 3)]
-                        runtime_state.next_retry_at = now_utc + timedelta(seconds=backoff)
-                except Exception as e:
-                    logger.error(f"Heartbeat dispatch error: {e}")
-                    runtime_state.heartbeat_pending = True
-                    runtime_state.heartbeat_in_flight = False
-                    runtime_state.heartbeat_retry_count += 1
-                    backoff = [30, 60, 120, 300][min(runtime_state.heartbeat_retry_count-1, 3)]
-                    runtime_state.next_retry_at = now_utc + timedelta(seconds=backoff)
-                finally:
-                    # Note: we do NOT clear heartbeat_in_flight here anymore.
-                    # It is cleared when the future resolves or times out.
-                    pass
-
-
+                notifier.send_sync(heartbeat_msg)
+                runtime_state.last_heartbeat_time = now_utc
+                logger.info("Heartbeat sent to Telegram.")
 
             for asset in MONITORED_ASSETS:
                 run_live_cycle(
@@ -1034,73 +918,3 @@ def main():
 
             # Corrected: Fetch open trades before checking
             open_trades = tracker.get_open_trades()
-            if open_trades:
-                for asset in MONITORED_ASSETS:
-                    manage_active_trades(exchange, tracker, notifier, asset['symbol'])
-
-            evolver.run_evolutionary_cycle() if not FREEZE_POST_MORTEM else logger.debug("PostMortemAgent frozen by configuration.")
-
-            if datetime.now().hour == 0 and datetime.now().minute == 0:
-                logger.info("Strategist: Scheduled daily strategy generation...")
-                for asset in MONITORED_ASSETS:
-                    new_strat = strategist.generate_new_strategy(asset['symbol'], asset['gran'])
-                    if new_strat:
-                        registry.add_challenger(new_strat)
-
-            challengers = [s for s in registry.get_all_strategies("XAU_USD") if not s.get("is_champion")]
-            if challengers:
-                worst_challenger = min(challengers, key=lambda x: x["performance"].get("win_rate", 0))
-                if worst_challenger["performance"].get("total_trades", 0) >= 5:
-                    logger.info(f"Strategist: Optimizing underperforming strategy {worst_challenger['version']}...")
-                    optimized_strat = strategist.optimize_strategy(worst_challenger, worst_challenger["performance"])
-                    if optimized_strat:
-                        instrument = worst_challenger.get('instrument', 'XAU_USD')
-                        registry.add_challenger(optimized_strat)
-
-            for asset in MONITORED_ASSETS:
-                promoted_version = registry.check_for_promotion(asset['symbol'])
-                if promoted_version:
-                    logger.info(f"🚀 STRATEGY PROMOTED for {asset['symbol']}: {promoted_version} is now the Champion!")
-                    notifier.send_sync(f"🚀 STRATEGY PROMOTED for {asset['symbol']}: {promoted_version} is now the Champion!")
-
-            portfolio_manager.check_health(exchange, notifier)
-
-            now_utc = datetime.now(timezone.utc)
-            # --- Daily Performance Summary ---
-            if now_utc.hour == 0 and now_utc.minute == 0:
-                logger.info("Scheduling daily performance summary report...")
-                # Calculate precise PnL using transactions (Task 9)
-                from datetime import timedelta
-                day_start = (now_utc - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-
-                daily_stats = risk_manager.calculate_account_daily_pnl(exchange, day_start)
-
-                report_msg = (
-                    f"📊 **Daily Verified Report**\n"
-                    f"Date: {now_utc.strftime('%Y-%m-%d')}\n"
-                    f"----------------------------\n"
-                    f"Total PnL: ${daily_stats['total_pnl']:.2f}\n"
-                    f"Verified Fills: {daily_stats['verified_trades']}\n"
-                    f"Rejected/Cancelled: {daily_stats['rejected_orders']}\n"
-                    f"----------------------------"
-                )
-                notifier.send_sync(report_msg)
-
-
-            for asset in MONITORED_ASSETS:
-                manage_active_trades(exchange, tracker, notifier, asset['symbol'])
-
-            logger.info(f"Cycle complete. Sleeping for {POLL_INTERVAL}s.")
-            time.sleep(POLL_INTERVAL)
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user.")
-    finally:
-        release_lock("bot.lock")
-        # Ensure Telegram listener is stopped cleanly on exit
-        try:
-            notifier.stop_listener()
-        except Exception as e:
-            logger.error(f"Error stopping Telegram listener: {e}")
-
-if __name__ == "__main__":
-    main()

@@ -1,0 +1,121 @@
+import os
+import logging
+import json
+from datetime import datetime
+from core.exchange_connector import ExchangeConnector
+from core.config import settings
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+def audit_account():
+    logger.info("--- Auditing Account Summary ---")
+    summary = connector.get_account_summary()
+    if not summary:
+        logger.error("FAILED: Account summary is None")
+        return
+
+    raw = summary.get('raw', {})
+    logger.info(f"Raw Account Response: {json.dumps(raw, indent=2)}")
+
+    # Verify NAV (Equity)
+    nav = raw.get('NAV')
+    logger.info(f"NAV Value: {nav} (Type: {type(nav)})")
+
+    # Verify Balance
+    balance = raw.get('balance')
+    logger.info(f"Balance Value: {balance} (Type: {type(balance)})")
+
+    # Verify normalization logic
+    if summary['equity'] == float(nav) and summary['balance'] == float(balance):
+        logger.info("SUCCESS: Account normalization is correct.")
+    else:
+        logger.error("FAILED: Normalization mismatch.")
+
+def audit_positions():
+    logger.info("\n--- Auditing Open Positions ---")
+    positions = connector.get_open_positions()
+    if positions is None:
+        logger.error("FAILED: get_open_positions returned None")
+        return
+
+    if not positions:
+        logger.info("No open positions found. (This is normal for empty accounts)")
+        return
+
+    for i, pos in enumerate(positions):
+        logger.info(f"Position {i}: {json.dumps(pos, indent=2)}")
+
+        # Audit Aggregation
+        longs = pos.get('long', {})
+        shorts = pos.get('short', {})
+
+        # Check for tradeIDs list
+        long_ids = longs.get('tradeIDs', [])
+        short_ids = shorts.get('tradeIDs', [])
+
+        logger.info(f"Long TradeIDs: {long_ids} (Count: {len(long_ids)})")
+        logger.info(f"Short TradeIDs: {short_ids} (Count: {len(short_ids)})")
+
+def audit_trade_details():
+    logger.info("\n--- Auditing Trade Details ---")
+    # We need a real trade ID to test this.
+    # We'll try to find one from current positions.
+    positions = connector.get_open_positions()
+    if not positions:
+        logger.info("No open positions to audit trade details.")
+        return
+
+    # Grab first available trade ID
+    pos = positions[0]
+    all_ids = pos.get('long', {}).get('tradeIDs', []) + pos.get('short', {}).get('tradeIDs', [])
+
+    if not all_ids:
+        logger.info("No trade IDs found in positions.")
+        return
+
+    trade_id = all_ids[0]
+    logger.info(f"Fetching details for trade: {trade_id}")
+    details = connector.get_trade_details(trade_id)
+
+    if not details:
+        logger.error(f"FAILED: No details returned for {trade_id}")
+        return
+
+    logger.info(f"Raw Trade Details: {json.dumps(details, indent=2)}")
+
+    # Check for PnL related fields (usually found in transactions or specific state)
+    # Note: OANDA trade details show the current state, not the final PnL.
+    # Final PnL is in transactions.
+    logger.info("Trade details verified.")
+
+def audit_pricing():
+    logger.info("\n--- Auditing Market Pricing ---")
+    instrument = "XAU_USD"
+    prices = connector.get_market_price(instrument)
+    if not prices:
+        logger.error(f"FAILED: No pricing returned for {instrument}")
+        return
+
+    logger.info(f"Pricing for {instrument}: {json.dumps(prices, indent=2)}")
+    if 'bid' in prices and 'ask' in prices:
+        logger.info("SUCCESS: Pricing format is correct.")
+    else:
+        logger.error("FAILED: Pricing missing bid/ask.")
+
+if __name__ == "__main__":
+    # Initialize connector using settings
+    connector = ExchangeConnector(
+        api_key=settings['OANDA_API_KEY'],
+        account_id=settings['OANDA_ACCOUNT_ID'],
+        simulation_mode=True # Audit in simulation to be safe
+    )
+
+    try:
+        audit_account()
+        audit_positions()
+        audit_trade_details()
+        audit_pricing()
+        logger.info("\nIntegration Audit Complete.")
+    except Exception as e:
+        logger.exception(f"Audit crashed: {e}")
