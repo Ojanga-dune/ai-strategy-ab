@@ -1,0 +1,17 @@
+{
+    "active_trades": {},
+    "last_cycle_timestamp": null,
+    "session_start_equity": null,
+    "heartbeat_pending": true,
+    "last_heartbeat_time": null,
+    "heartbeat_due_at": null,
+    "heartbeat_retry_count": 0,
+    "heartbeat_next_retry_at": null,
+    "outage_generation_id": 1,
+    "recovery_notified_generation_id": 0,
+    "connectivity_health": {
+        "telegram": true,
+        "broker": false
+    },
+    "is_outage_active": true
+}

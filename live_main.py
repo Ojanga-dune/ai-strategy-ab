@@ -1,9 +1,10 @@
 import time
 import logging
 import os
+import threading
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 # Silence httpx request logging to prevent tokens/URLs from leaking in logs
 import logging as py_logging
@@ -33,9 +34,8 @@ from core.runtime_state import BotRuntimeState
 # Load environment variables
 # Now handled by core.config.settings singleton
 
-
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("LiveBot")
@@ -49,12 +49,10 @@ def flatten_broker_trade_ids(positions: List[Dict[str, Any]]) -> set:
 
     all_ids = set()
     for pos in positions:
-        # Extract IDs from long block
         long_ids = pos.get('long', {}).get('tradeIDs', [])
         if isinstance(long_ids, list):
             all_ids.update(long_ids)
 
-        # Extract IDs from short block
         short_ids = pos.get('short', {}).get('tradeIDs', [])
         if isinstance(short_ids, list):
             all_ids.update(short_ids)
@@ -68,18 +66,12 @@ def resolve_trade_pnl(exchange: ExchangeConnector, trade_id: str, retries: int =
     """
     for i in range(retries):
         try:
-            # --- Primary Lookup (Trade Details) ---
-            # This endpoint provides the aggregate PnL for the entire trade lifetime
             trade_details = exchange.get_trade_details(trade_id)
             if trade_details:
-                # OANDA trade details include realizedPL (gain/loss on close)
-                # and financing (swaps/overnight interest).
                 realized = trade_details.get('realizedPL', 0)
                 financing = trade_details.get('financing', 0)
 
                 try:
-                    # Net PnL = Realized Profit/Loss + Financing (swaps)
-                    # Commission is typically bundled in realizedPL or handled at account level
                     total_pnl = float(realized) + float(financing)
                     logger.info(f"Net PnL resolved via Trade Details for {trade_id}: {total_pnl:.2f}")
                     return total_pnl
@@ -102,26 +94,20 @@ def manage_active_trades(exchange: ExchangeConnector, tracker: TradeTracker, not
     Delegates closure detection and recording to monitor_trade_outcomes.
     """
     try:
-        # 1. Obtain local open trades
         local_open = tracker.get_open_trades()
 
-        # 2. Obtain broker positions (authoritative state)
         try:
             broker_positions = exchange.get_open_positions(instrument)
             if broker_positions is None:
-                # This is an API failure
                 raise ValueError("Broker API returned None (Failure)")
         except Exception as e:
             logger.error(f"Broker query failed for {instrument}: {e}. Skipping active management to prevent erroneous closures.")
             return
 
-        # Extract all active IDs using the flatten helper
         active_ids = flatten_broker_trade_ids(broker_positions)
 
         logger.info(f"Active Management [{instrument}]: Local Trades: {len(local_open)}, Broker Trade IDs: {len(active_ids)}")
 
-        # 3. Reconciliation is now handled purely by monitor_trade_outcomes
-        # based on the identified authoritative ID set.
         monitor_trade_outcomes(exchange, tracker, notifier, StrategyRegistry(), MONITORED_ASSETS, active_ids)
 
     except Exception as e:
@@ -135,7 +121,6 @@ def monitor_trade_outcomes(exchange: ExchangeConnector, tracker: TradeTracker, n
     if not open_trades:
         return
 
-    # If active_broker_ids was not passed (e.g. called from elsewhere), fetch them
     if active_broker_ids is None:
         broker_pos = exchange.get_open_positions()
         if broker_pos is None:
@@ -145,7 +130,6 @@ def monitor_trade_outcomes(exchange: ExchangeConnector, tracker: TradeTracker, n
 
     logger.info(f"Monitoring {len(open_trades)} open trades for outcomes...")
 
-    # Optimization: pre-fetch common data for shadow trades
     current_prices = {}
     for asset in monitored_assets:
         instrument = asset['symbol']
@@ -158,7 +142,6 @@ def monitor_trade_outcomes(exchange: ExchangeConnector, tracker: TradeTracker, n
         t_trade_id = trade.get('trade_id')
         t_order_id = trade.get('order_id')
 
-        # --- Shadow Trade Handling ---
         if trade.get('is_simulated', False):
             instrument = trade.get('instrument')
             if instrument not in current_prices: continue
@@ -188,7 +171,6 @@ def monitor_trade_outcomes(exchange: ExchangeConnector, tracker: TradeTracker, n
                 notifier.send_sync(f"👻 Shadow Trade {strat_version} closed: {reason} (PnL: {pnl:.3f})")
             continue
 
-        # --- Live Trade Handling ---
         if not t_trade_id and t_order_id:
             logger.info(f"Resolving missing TradeID for {t_local_id} using OrderID {t_order_id}...")
             resolved_trade_id = exchange.get_trade_id_from_order(t_order_id)
@@ -214,17 +196,12 @@ def monitor_trade_outcomes(exchange: ExchangeConnector, tracker: TradeTracker, n
             logger.warning(f"Trade {t_trade_id} details unavailable (API failure). Preserving OPEN state.")
             continue
 
-        # Only proceed to close if broker confirms trade is closed (missing from positions AND details available)
-        # Actually, get_trade_details returns the trade regardless of open/closed status.
-        # The fact that it's missing from active_broker_ids is the primary trigger.
-        # We just need to resolve PnL.
         realized_pnl = resolve_trade_pnl(exchange, t_trade_id)
         if realized_pnl is not None:
             tracker.update_outcome(t_local_id, {"status": "CLOSED", "pnl": realized_pnl, "pnl_source": "oanda"})
             notifier.send_sync(f"🏁 Trade Closed: {t_trade_id}. PnL: {realized_pnl:.2f}")
         else:
             logger.warning(f"Trade {t_trade_id} closure confirmed, but PnL resolution failed. Retrying next cycle.")
-
 
 def run_live_cycle(
     instrument: str,
@@ -241,7 +218,8 @@ def run_live_cycle(
     candle_guard: CandleGuard,
     news_guard: NewsGuard,
     signal_tracker: SignalTracker,
-    circuit_breaker: CircuitBreaker
+    circuit_breaker: CircuitBreaker,
+    orchestrator: Any
 ):
     """
     A single iteration of the Live Loop:
@@ -268,9 +246,6 @@ def run_live_cycle(
         last_candle_time = df.index[-1]
         gran_map = {'H4': 14400, 'H1': 3600, 'M30': 1800, 'M15': 900, 'M5': 300, 'M1': 60}
         gran_seconds = gran_map.get(granularity, 3600)
-
-        # Candle completion is now handled by ExchangeConnector (filters complete:true)
-        # Redundant CandleGuard time-check removed to rely strictly on broker signal.
 
         df = datalake._calculate_indicators(df)
         strategies = registry.get_all_strategies(instrument)
@@ -326,7 +301,6 @@ def run_live_cycle(
             if is_champion:
                 logger.info(f"Champion ({strat_version}) approved a trade. Proceeding to Execution Guard...")
 
-                # --- Global Position Cap Check ---
                 all_open_positions = exchange.get_open_positions()
                 if len(all_open_positions) >= MAX_OPEN_POSITIONS:
                     logger.warning(f"Guard: Trade blocked. Global position cap reached ({len(all_open_positions)}/{MAX_OPEN_POSITIONS}).")
@@ -350,7 +324,7 @@ def run_live_cycle(
 
                 is_bullish = "bullish" in latest_trade.get('ai_reasoning', '').lower()
                 sl_price = latest_trade['price'] - sl_dist if is_bullish else latest_trade['price'] + sl_dist
-                tp_price = latest_trade['price'] + tp_dist if is_bullish else latest_trade['price'] - tp_dist
+                tp_price = latest_trade['price'] + tp_dist if is_bullish else latest_trade['price'] + tp_dist
 
                 lots = risk_manager.calculate_position_size(
                     account_balance=balance,
@@ -360,16 +334,13 @@ def run_live_cycle(
                 )
                 side_lots = lots if is_bullish else -lots
 
-                # --- Execution with Retry Logic ---
                 max_retries = 3
                 retry_delay = 2
                 result = None
-                consecutive_rejections = 0 # This would need to be persisted/shared across cycles
+                consecutive_rejections = 0
 
-                # Generate CID before the loop to check for existing orders
                 client_id = f"sig_{strat_version}_{instrument}_{int(latest_trade['timestamp'].timestamp())}"
 
-                # --- Signal Idempotency Check ---
                 if signal_tracker.is_consumed(strat_version, instrument, latest_trade['timestamp'].timestamp()):
                     logger.info(f"Signal {client_id} already consumed. Skipping to prevent repeated attempts.")
                     continue
@@ -394,12 +365,9 @@ def run_live_cycle(
                         break
 
                     error_code = result.get('error_code') if result else None
-                    # Ensure error_code is an integer before comparing
                     if error_code is not None:
                         try:
                             code = int(error_code)
-                            # Non-retryable errors: 400 (Bad Request), 401 (Unauthorized), 403 (Forbidden)
-                            # Retryable: 429 (Too Many Requests), 5xx (Server Errors)
                             if 400 <= code < 500 and code != 429:
                                 logger.warning(f"Non-retryable error {code}: {result.get('message', 'Unknown error')}. Stopping retries.")
                                 break
@@ -407,9 +375,7 @@ def run_live_cycle(
                             logger.warning(f"Order rejected with non-integer error code {error_code}: {result.get('message', 'Unknown error')}. Stopping retries.")
                             break
                     else:
-                        # If no error code, but result indicates failure, we might want to break
                         if result and result.get('status') == 'error':
-                            # We only retry if it's a likely network issue; if it's a structured error without a code, we stop.
                             break
 
                     if attempt < max_retries - 1:
@@ -418,8 +384,6 @@ def run_live_cycle(
 
                 if not result or (result.get('status') == 'error' and 'orderFillTransaction' not in (result or {})):
                     error_status = result.get('error_code', 'UNKNOWN') if result else 'NETWORK_ERROR'
-                    # Store the full OANDA response for post-mortem analysis.
-                    # We strip tokens to prevent security leaks in the JSON files.
                     full_response = result if result else 'No response'
                     if isinstance(full_response, dict) and 'token' in full_response:
                         full_response = {k: v for k, v in full_response.items() if k != 'token'}
@@ -436,10 +400,8 @@ def run_live_cycle(
                     temp_id = (result or {}).get('orderCreateTransaction', {}).get('id', f"rejected_{int(time.time())}")
                     tracker.record_entry(temp_id, reject_record)
 
-                    # Mark signal as consumed so we don't retry it in the next cycle
                     signal_tracker.mark_consumed(strat_version, instrument, latest_trade['timestamp'].timestamp())
 
-                    # Record rejection in circuit breaker
                     tripped, reason = circuit_breaker.record_rejection()
                     if tripped:
                         notifier.send_sync(f"🚨 **CIRCUIT BREAKER TRIPPED**\n{reason}\nTrading halted for this account.")
@@ -484,7 +446,6 @@ def run_live_cycle(
                     notifier.send_sync(error_msg)
                     if 'orderCreateTransaction' in result:
                         order_id = result['orderCreateTransaction']['id']
-                        # For cancelled orders, we use a derived local ID since there is no tradeID
                         local_id = f"trade_{int(time.time())}_{order_id}"
                         tracker.update_outcome(local_id, {"status": "CLOSED", "pnl": 0, "reason": "Cancelled"})
                 elif result.get('status') == 'error':
@@ -515,7 +476,7 @@ def run_live_cycle(
                 tp_dist = current_atr * 3.0
                 is_bullish = "bullish" in latest_trade.get('ai_reasoning', '').lower()
                 sl_price = latest_trade['price'] - sl_dist if is_bullish else latest_trade['price'] + sl_dist
-                tp_price = latest_trade['price'] + tp_dist if is_bullish else latest_trade['price'] - tp_dist
+                tp_price = latest_trade['price'] + tp_dist if is_bullish else latest_trade['price'] + tp_dist
 
                 shadow_trade_id = f"shadow_{strat_version}_{latest_trade['timestamp'].timestamp()}"
                 trade_dna = {
@@ -525,12 +486,12 @@ def run_live_cycle(
                     'sl': sl_price,
                     'tp': tp_price,
                     'ai_reasoning': latest_trade.get('ai_reasoning'),
-                    'timestamp': latest_trade['timestamp'].isoformat() if hasattr(latest_trade['timestamp'], 'isoformat') else latest_trade['timestamp'],
+                    'timestamp': latest_trade['timestamp'].isoformat(),
                     'strategy_version': strat_version,
                     'is_simulated': True
                 }
                 tracker.record_entry(shadow_trade_id, trade_dna)
-                logger.info(f"Shadow trade recorded for {strat_version}: {shadow_trade_id} (SL: {sl_price:.3f}, TP: {tp_price:.3f})")
+                logger.info(f"Shadow trade recorded for {strat_version}: {shadow_trade_id}")
 
     except Exception as e:
         logger.error(f"Error during live cycle for {instrument}: {e}", exc_info=True)
@@ -610,45 +571,37 @@ def cmd_daily(text, context, tracker, registry):
 
 def cmd_status(text, context, exchange, runtime, compliance, tracker, breaker, notifier):
     """Read-only bot health dashboard."""
-    # Verify authoritative state identity
-    # If we are in a test/dev environment, we can assert id(runtime) is consistent
-    # In production, this ensures callbacks are using the same instance as the main loop.
+    if runtime:
+        logger.info(f"[IDENTITY-AUDIT] cmd_status | ID: {id(runtime)} | Cycles: {runtime.cycle_count}")
 
-    # 1. Basic Health
     uptime = runtime.get_uptime_str()
     cycles = runtime.cycle_count
     last_cycle = runtime.last_cycle_timestamp
     last_cycle_str = last_cycle.strftime('%H:%M:%S UTC') if last_cycle else "N/A"
 
-    # 2. Connectivity & Environment
     conn_status = getattr(exchange, 'connection_status', 'UNKNOWN')
     env = settings.get('oanda_env', 'unknown')
     sim_mode = settings.get('simulation_mode', False)
     telegram_status = notifier.state
 
-    # 3. Account & Compliance
     summary = exchange.get_account_summary()
     equity = summary.get('equity') if summary else None
     pnl = 0.0
     if summary and tracker.load_equity_snapshot():
         pnl = equity - tracker.load_equity_snapshot()
 
-    comp_status = compliance.get_status_summary(equity, pnl)
+    comp_status = compliance.get_status_summary(equity if is_account_available else None, current_pnl)
 
-    # 4. Trade State
     open_trades = tracker.get_open_trades()
     trade_count = len(open_trades)
 
-    # 5. Safety & Recovery
     breaker_status = "TRIPPED 🚨" if breaker.is_tripped() else "OK ✅"
     breaker_reason = breaker.last_reason if breaker.is_tripped() else "N/A"
 
-    # Use state_manager for authoritative boot count
     from core.state_manager import StateManager
     sm = StateManager()
     boot_count = sm.get_boot_count()
 
-    # 6. Recent Errors
     errors = list(runtime.error_buffer)
     error_msg = "\n".join(errors) if errors else "None"
 
@@ -682,16 +635,144 @@ MONITORED_ASSETS = [
     {"symbol": "BTC_USD", "gran": "H1"},
     {"symbol": "NAS100_USD", "gran": "H1"},
 ]
-POLL_INTERVAL = 30  # Temporarily shortened for smoke test (usually 3600)
-MAX_OPEN_POSITIONS = 1    # Maximum allowed open positions across all assets
-FREEZE_POST_MORTEM = True # If True, disables the evolutionary strategy cycle
+POLL_INTERVAL = 30
+MAX_OPEN_POSITIONS = 1
+FREEZE_POST_MORTEM = True
+
+class LiveBotOrchestrator:
+    """
+    Authoritative coordinator for bot lifecycle, outage state, and recovery.
+    """
+    def __init__(self, runtime_state: BotRuntimeState, state_manager: StateManager, notifier: NotificationManager, exchange: ExchangeConnector):
+        self.runtime_state = runtime_state
+        self.state_manager = state_manager
+        self.notifier = notifier
+        self.exchange = exchange
+        self._outage_lock = threading.Lock()
+
+    def _enter_outage(self, source: str, error: Exception):
+        """
+        Thread-safe, idempotent transition into an outage state.
+        """
+        with self._outage_lock:
+            now_utc = datetime.now(timezone.utc)
+
+            # Idempotency: Check if we are already in this outage generation
+            if self.runtime_state.outage_generation_id == self.runtime_state.recovery_notified_generation_id:
+                logger.info(f"Entering NEW outage. Source: {source} | Error: {error}")
+                self.runtime_state.outage_generation_id += 1
+                self.runtime_state.is_outage_active = True
+                self.runtime_state.heartbeat_pending = True
+            else:
+                logger.debug(f"Already in outage {self.runtime_state.outage_generation_id}. Source {source} reporting failure: {error}")
+
+            # Update component health
+            if source == "telegram":
+                self.runtime_state.connectivity_health["telegram"] = False
+            elif source == "broker" or source == "network":
+                self.runtime_state.connectivity_health["broker"] = False
+                self.exchange.connection_status = "DISCONNECTED"
+
+            # Atomic Persistence
+            self.state_manager.save_heartbeat_metrics(
+                self.runtime_state.last_heartbeat_time,
+                self.runtime_state.heartbeat_due_at,
+                self.runtime_state.heartbeat_pending,
+                self.runtime_state.heartbeat_retry_count,
+                self.runtime_state.next_retry_at,
+                runtime_state=self.runtime_state
+            )
+            logger.info(f"Outage state persisted. Gen: {self.runtime_state.outage_generation_id} | Health: {self.runtime_state.connectivity_health}")
+
+    def verify_connectivity(self) -> bool:
+        """
+        Strict validation of all critical dependencies before closing an outage.
+        """
+        # 1. Telegram Health
+        if self.notifier.state != "RUNNING":
+            return False
+
+        # 2. Broker Health (read-only probe)
+        try:
+            summary = self.exchange.get_account_summary(bypass_guard=True)
+            if summary is None:
+                return False
+        except Exception:
+            return False
+
+        return True
+
+    def handle_recovery(self, now_utc: datetime):
+        """
+        Handles the confirmed recovery sequence.
+        """
+        # Trigger recovery if: outage active AND health verified AND not currently sending
+        if (self.runtime_state.is_outage_active and
+            self.verify_connectivity() and
+            not self.runtime_state.heartbeat_in_flight):
+
+            with self._outage_lock:
+                if self.runtime_state.outage_generation_id == self.runtime_state.recovery_notified_generation_id:
+                    # Already notified for this generation
+                    self.runtime_state.is_outage_active = False
+                    return
+
+                logger.info(f"Connectivity validated. Dispatching recovery for gen {self.runtime_state.outage_generation_id}...")
+
+                # Recovery Message
+                offline_duration = "unknown"
+                if self.runtime_state.last_heartbeat_time:
+                    diff = now_utc - self.runtime_state.last_heartbeat_time
+                    offline_duration = f"{diff.total_seconds()/3600:.1f}h"
+
+                recovery_msg = (
+                    f"♻️ **Connectivity Restored**\n"
+                    f"Offline duration: ~{offline_duration}\n"
+                    f"Cycles caught up: {self.runtime_state.cycle_count}\n"
+                    f"Bot state: RUNNING ✅"
+                )
+
+                # At-least-once delivery attempt
+                future = self.notifier.send_sync(recovery_msg)
+                if future:
+                    self.runtime_state.current_heartbeat_future = future
+                    self.runtime_state.heartbeat_in_flight = True
+                    self.runtime_state.heartbeat_send_deadline = now_utc + timedelta(seconds=30)
+                    logger.info("Recovery notification dispatched. Awaiting confirmation.")
+                else:
+                    logger.warning("Recovery message failed to schedule. Will retry next cycle.")
+
+    def finalize_recovery(self, now_utc: datetime):
+        """
+        Closes the outage state only after confirmed delivery of recovery notification.
+        """
+        if self.runtime_state.heartbeat_in_flight and self.runtime_state.current_heartbeat_future:
+            future = self.runtime_state.current_heartbeat_future
+            if future.done():
+                try:
+                    # Confirmed delivery
+                    with self._outage_lock:
+                        logger.info(f"Recovery confirmed for outage gen {self.runtime_state.outage_generation_id}")
+                        self.runtime_state.recovery_notified_generation_id = self.runtime_state.outage_generation_id
+                        self.runtime_state.is_outage_active = False
+                        self.runtime_state.heartbeat_pending = False
+                        self.runtime_state.connectivity_health = {"telegram": True, "broker": True}
+
+                        self.state_manager.save_heartbeat_metrics(
+                            self.runtime_state.last_heartbeat_time,
+                            self.runtime_state.heartbeat_due_at,
+                            self.runtime_state.heartbeat_pending,
+                            self.runtime_state.heartbeat_retry_count,
+                            self.runtime_state.next_retry_at,
+                            runtime_state=self.runtime_state
+                        )
+                except Exception as e:
+                    logger.warning(f"Recovery confirmation error: {e}")
 
 def main():
     # --- Single Instance Lock ---
     is_managed = os.getenv("BOT_MANAGED_BY_LAUNCHER", "false").lower() == "true"
 
-    # 1. Check if a managed launcher is already running
-    # The launcher owns 'bot.lock'
     lock_file = "bot.lock"
     if os.path.exists(lock_file):
         try:
@@ -699,17 +780,13 @@ def main():
                 content = f.read().strip()
 
             if content:
-                # Expected format: launcher_pid|child_pid|started_at|project_path|session_uuid
                 parts = content.split('|')
                 if len(parts) >= 5:
                     launcher_pid = int(parts[0])
                     session_uuid = parts[4]
 
-                    # Verify launcher is actually alive and is the authoritative one
                     import psutil
                     if psutil.pid_exists(launcher_pid):
-                        # Validate that the process is actually a powershell/cmd process
-                        # and not a random reused PID
                         try:
                             proc = psutil.Process(launcher_pid)
                             cmdline = " ".join(proc.cmdline())
@@ -717,27 +794,21 @@ def main():
                                 if not is_managed:
                                     logger.error(f"Managed bot instance already running (Launcher PID: {launcher_pid}). Manual launch refused.")
                                     return
-                                # If is_managed is True, the launcher is our parent; we are allowed to start.
                         except (psutil.NoSuchProcess, psutil.AccessDenied):
                             pass
-                else:
-                    logger.warning("Lock file found but format is invalid. Relying on launcher for cleanup.")
         except (ValueError, OSError) as e:
             logger.debug(f"Could not parse launcher lock: {e}")
 
-    # 2. Handle Direct Launch Protection
     if not is_managed:
         direct_lock = "live_main.lock"
         success, pid = acquire_lock(direct_lock)
         if not success:
-            logger.error(f"Another manual instance of the bot is already running (PID: {pid}). Exiting.")
+            logger.error(f"Another manual instance of the bot is running (PID: {pid}). Exiting.")
             return
     else:
         logger.info("Bot startup: Managed by launcher (skipping local lock acquisition).")
 
-
     try:
-        # Configuration is now handled by core.config.settings singleton
         api_key = settings['api_key']
         account_id = settings['account_id']
 
@@ -745,41 +816,44 @@ def main():
             logger.error("Missing OANDA_API_KEY or OANDA_ACCOUNT_ID in environment variables.")
             return
 
-        # --- Initialization ---
         logger.info("Initializing Autonomous Live Bot...")
 
-        # Initialize Runtime State
         runtime_state = BotRuntimeState()
-
-        # Initialize State Manager first to avoid UnboundLocalError
         state_manager = StateManager()
 
-        # Recover and increment boot count
         boot_count = state_manager.get_boot_count() + 1
         state_manager.save_boot_count(boot_count)
         runtime_state.boot_count = boot_count
         logger.info(f"Bot Startup: Boot Count = {boot_count}")
 
-        # Use absolute path for data directory from settings
+        # Recover heartbeat and outage state
+        metrics = state_manager.load_heartbeat_metrics()
+        runtime_state.last_heartbeat_time = metrics[0]
+        runtime_state.heartbeat_due_at = metrics[1]
+        runtime_state.heartbeat_pending = metrics[2]
+        runtime_state.heartbeat_retry_count = metrics[3]
+        runtime_state.next_retry_at = metrics[4]
+        runtime_state.outage_generation_id = metrics[5]
+        runtime_state.recovery_notified_generation_id = metrics[6]
+        runtime_state.connectivity_health = metrics[7]
+        runtime_state.is_outage_active = metrics[8]
+
         data_dir = settings['data_dir']
         data_dir.mkdir(parents=True, exist_ok=True)
-        
+
         dl = DataLake(api_key=api_key, account_id=account_id)
         engine = StrategyEngine()
         reviewer = AIReviewer()
         risk_manager = RiskManager(risk_per_trade=0.01)
         tracker = TradeTracker()
-        state_manager = StateManager()
         evolver = PostMortemAgent()
         news_guard = NewsGuard()
         signal_tracker = SignalTracker()
         circuit_breaker = CircuitBreaker(threshold=5)
 
-        # Recover daily equity benchmark if it exists
         saved_equity = tracker.load_equity_snapshot()
         if saved_equity:
             logger.info(f"Recovered daily equity benchmark from disk: ${saved_equity:.2f}")
-
 
         backtester = ParallelBacktester(dl)
         strategist = StrategistAgent(backtester=backtester)
@@ -791,23 +865,9 @@ def main():
             runtime_state=runtime_state
         )
 
-        # Safety Interlock: Force practice mode unless explicitly enabled
         is_live_enabled = os.getenv("LIVE_TRADING", "False").lower() == "true"
         simulation_mode = not is_live_enabled
 
-        # Account ID Prefix Check: 101- (Practice) / 001- (Live)
-        id_prefix = account_id.split('-')[0]
-        if (is_live_enabled and id_prefix == "101") or (not is_live_enabled and id_prefix == "001"):
-            error_msg = f"CRITICAL: Account ID prefix ({id_prefix}) mismatches LIVE_TRADING setting ({is_live_enabled}). Aborting for safety."
-            logger.critical(error_msg)
-            notifier.send_sync(error_msg)
-            return
-
-        # Safety Interlock: Force practice mode unless explicitly enabled
-        is_live_enabled = os.getenv("LIVE_TRADING", "False").lower() == "true"
-        simulation_mode = not is_live_enabled
-
-        # Account ID Prefix Check: 101- (Practice) / 001- (Live)
         id_prefix = account_id.split('-')[0]
         if (is_live_enabled and id_prefix == "101") or (not is_live_enabled and id_prefix == "001"):
             error_msg = f"CRITICAL: Account ID prefix ({id_prefix}) mismatches LIVE_TRADING setting ({is_live_enabled}). Aborting for safety."
@@ -830,6 +890,9 @@ def main():
         session_filter = SessionFilter()
         candle_guard = CandleGuard()
 
+        # Setup Orchestrator
+        orchestrator = LiveBotOrchestrator(runtime_state, state_manager, notifier, exchange)
+
         notifier.register_callback('positions', lambda t, c: cmd_positions(t, c, exchange))
         notifier.register_callback('close_all', lambda t, c: cmd_close_all(t, c, exchange))
         notifier.register_callback('close_partial', lambda t, c: cmd_close_partial(t, c, exchange))
@@ -849,27 +912,28 @@ def main():
         else:
             logger.info("Reconciliation complete. State is synchronized with broker.")
 
-        logger.info(f"Total active positions: {len(broker_positions)}.")
-
-        notifier.start_listener()
+        notifier.start_listener(orchestrator=orchestrator)
 
     except Exception as e:
         logger.exception(f"Critical error during bot initialization: {e}")
         return
 
     logger.info(f"Bot is now LIVE. Monitoring {len(MONITORED_ASSETS)} assets every {POLL_INTERVAL}s.")
-    logger.info("Press Ctrl+C to stop the bot.")
 
     try:
         while True:
+            now_utc = datetime.now(timezone.utc)
+
             # --- OANDA Auth Recovery ---
             if exchange.connection_status == "AUTH_FAILED":
                 logger.warning("Broker auth failed. Triggering recovery flow...")
                 exchange.handle_auth_recovery(state_manager)
 
+            # 1. Broker Connectivity Check (Trigger Outage if failed)
             summary = exchange.get_account_summary()
             if summary is None:
-                logger.warning("Account summary unavailable. Skipping compliance and entries for this cycle.")
+                logger.warning("Account summary unavailable. Checking for outage...")
+                orchestrator._enter_outage("broker", Exception("Account summary returned None"))
                 is_account_available = False
                 equity = None
                 balance = None
@@ -878,28 +942,21 @@ def main():
                 balance = summary['balance']
                 is_account_available = True
 
-            # Update daily benchmark and persist it to disk
             if is_account_available:
                 compliance_guard.update_daily_start(equity)
                 tracker.save_equity_snapshot(equity)
 
-            # Daily PnL = Current Total Equity - Equity at start of day
             start_equity = tracker.load_equity_snapshot()
             if start_equity is None:
                 start_equity = equity if is_account_available else 0.0
 
             current_pnl = (equity - start_equity) if is_account_available else 0.0
-
             is_compliant, reason = compliance_guard.check_compliance(equity if is_account_available else None, current_pnl)
-
-
-
 
             if not is_compliant:
                 error_msg = f"🚨 COMPLIANCE VIOLATION: {reason}\n\nExecuting Emergency Shutdown..."
                 notifier.send_sync(error_msg)
                 logger.critical(error_msg)
-                # Emergency close all
                 all_pos = exchange.get_open_positions()
                 for p in all_pos:
                     inst = p.get('instrument', 'XAU_USD')
@@ -908,51 +965,60 @@ def main():
                         exchange.place_market_order(inst, -units)
                 return
 
-            # --- Heartbeat Logic ---
-            now_utc = datetime.now(timezone.utc)
-
-            # Use configurable heartbeat interval with a safe default
+            # --- Heartbeat and Recovery Logic ---
             heartbeat_interval = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", 14400))
 
-            # 1. Process In-Flight Heartbeat Result
-            if runtime_state.heartbeat_in_flight:
-                # We track the Future and a deadline
-                # The Future is stored in a variable outside the loop or in runtime_state
-                # Since we are in a loop, we need a way to reference the last sent Future.
-                # Let's assume we added 'current_heartbeat_future' to runtime_state.
-                pass
+            # A. Finalize previous recovery/heartbeat attempt
+            orchestrator.finalize_recovery(now_utc)
 
-            # Check for recovery notification first
-            if runtime_state.heartbeat_pending and notifier.state == "RUNNING" and not runtime_state.heartbeat_in_flight:
-                # Mark as in-flight to prevent duplicate recovery messages
-                runtime_state.heartbeat_in_flight = True
-                runtime_state.heartbeat_attempt_id += 1
-                current_attempt = runtime_state.heartbeat_attempt_id
+            # B. Process in-flight heartbeat result
+            if runtime_state.heartbeat_in_flight and runtime_state.current_heartbeat_future:
+                future = runtime_state.current_heartbeat_future
+                if future.done():
+                    try:
+                        logger.info("Heartbeat delivery confirmed.")
+                        runtime_state.last_heartbeat_time = now_utc
+                        runtime_state.heartbeat_due_at = now_utc + timedelta(seconds=heartbeat_interval)
 
-                offline_duration = "unknown"
-                if runtime_state.last_heartbeat_time:
-                    diff = now_utc - runtime_state.last_heartbeat_time
-                    offline_duration = f"{diff.total_seconds()/3600:.1f}h"
+                        if runtime_state.heartbeat_pending:
+                            runtime_state.recovery_notified_generation_id = runtime_state.outage_generation_id
+                            logger.info(f"Recovery confirmed for outage gen {runtime_state.outage_generation_id}")
 
-                recovery_msg = (
-                    f"♻️ **Connectivity Restored**\n"
-                    f"Offline duration: ~{offline_duration}\n"
-                    f"Cycles caught up: {runtime_state.cycle_count}\n"
-                    f"Bot state: RUNNING ✅"
-                )
+                        runtime_state.heartbeat_pending = False
+                        runtime_state.heartbeat_in_flight = False
+                        runtime_state.heartbeat_retry_count = 0
+                        runtime_state.next_retry_at = None
+                        runtime_state.current_heartbeat_future = None
 
-                # Non-blocking dispatch
-                future = notifier.send_sync(recovery_msg)
-                if future:
-                    runtime_state.current_heartbeat_future = future
-                    runtime_state.heartbeat_send_deadline = now_utc + timedelta(seconds=30)
-                    # We only clear pending upon SUCCESS of this future
-                else:
-                    # Immediate failure
-                    runtime_state.heartbeat_in_flight = False
-                    logger.warning("Recovery message failed to schedule.")
+                        state_manager.save_heartbeat_metrics(
+                            runtime_state.last_heartbeat_time,
+                            runtime_state.heartbeat_due_at,
+                            runtime_state.heartbeat_pending,
+                            runtime_state.heartbeat_retry_count,
+                            runtime_state.next_retry_at,
+                            runtime_state=runtime_state
+                        )
+                    except Exception as e:
+                        logger.warning(f"Heartbeat delivery failed: {e}")
+                        runtime_state.heartbeat_in_flight = False
+                        runtime_state.heartbeat_pending = True
+                        runtime_state.current_heartbeat_future = None
+                        runtime_state.heartbeat_retry_count += 1
+                        backoff = [30, 60, 120, 300][min(runtime_state.heartbeat_retry_count-1, 3)]
+                        runtime_state.next_retry_at = now_utc + timedelta(seconds=backoff)
+                        state_manager.save_heartbeat_metrics(
+                            runtime_state.last_heartbeat_time,
+                            runtime_state.heartbeat_due_at,
+                            runtime_state.heartbeat_pending,
+                            runtime_state.heartbeat_retry_count,
+                            runtime_state.next_retry_at,
+                            runtime_state=runtime_state
+                        )
 
-            # Trigger heartbeat if due or first run
+            # C. Check for recovery notification trigger
+            orchestrator.handle_recovery(now_utc)
+
+            # D. Trigger heartbeat if due
             if (runtime_state.last_heartbeat_time is None or
                 (runtime_state.heartbeat_due_at and now_utc >= runtime_state.heartbeat_due_at) or
                 (runtime_state.next_retry_at and now_utc >= runtime_state.next_retry_at) or
@@ -960,20 +1026,19 @@ def main():
                  (now_utc - runtime_state.last_heartbeat_time).total_seconds() >= heartbeat_interval if runtime_state.last_heartbeat_time else True)):
 
                 if runtime_state.heartbeat_in_flight:
-                    # Check for timeout
                     if runtime_state.heartbeat_send_deadline and now_utc > runtime_state.heartbeat_send_deadline:
                         logger.warning("Heartbeat send deadline exceeded. Marking as failed.")
                         runtime_state.heartbeat_in_flight = False
                         runtime_state.heartbeat_pending = True
+                        runtime_state.current_heartbeat_future = None
                     else:
                         continue
 
                 runtime_state.heartbeat_in_flight = True
                 runtime_state.heartbeat_attempt_id += 1
-                current_attempt = runtime_state.heartbeat_attempt_id
+                current_attempt_id = runtime_state.heartbeat_attempt_id
 
                 try:
-                    # Generate concise health report for heartbeat
                     heartbeat_msg = (
                         f"💓 **Bot Heartbeat**\n"
                         f"Uptime: {runtime_state.get_uptime_str()}\n"
@@ -988,30 +1053,23 @@ def main():
                         if future:
                             runtime_state.current_heartbeat_future = future
                             runtime_state.heartbeat_send_deadline = now_utc + timedelta(seconds=30)
-                            logger.info(f"Heartbeat {current_attempt} dispatched. Awaiting confirmation...")
+                            logger.info(f"Heartbeat {current_attempt_id} dispatched.")
                         else:
                             raise Exception("Failed to schedule Future")
                     else:
-                        logger.warning(f"Heartbeat skipped: Notifier is {notifier.state}. Marking as pending.")
-                        runtime_state.heartbeat_pending = True
+                        logger.warning(f"Heartbeat skipped: Notifier is {notifier.state}.")
+                        orchestrator._enter_outage("telegram", Exception(f"Notifier state {notifier.state}"))
                         runtime_state.heartbeat_in_flight = False
-                        # Schedule retry
                         runtime_state.heartbeat_retry_count += 1
                         backoff = [30, 60, 120, 300][min(runtime_state.heartbeat_retry_count-1, 3)]
                         runtime_state.next_retry_at = now_utc + timedelta(seconds=backoff)
                 except Exception as e:
                     logger.error(f"Heartbeat dispatch error: {e}")
-                    runtime_state.heartbeat_pending = True
+                    orchestrator._enter_outage("telegram", e)
                     runtime_state.heartbeat_in_flight = False
                     runtime_state.heartbeat_retry_count += 1
                     backoff = [30, 60, 120, 300][min(runtime_state.heartbeat_retry_count-1, 3)]
                     runtime_state.next_retry_at = now_utc + timedelta(seconds=backoff)
-                finally:
-                    # Note: we do NOT clear heartbeat_in_flight here anymore.
-                    # It is cleared when the future resolves or times out.
-                    pass
-
-
 
             for asset in MONITORED_ASSETS:
                 run_live_cycle(
@@ -1029,10 +1087,10 @@ def main():
                     candle_guard,
                     news_guard,
                     signal_tracker,
-                    circuit_breaker
+                    circuit_breaker,
+                    orchestrator
                 )
 
-            # Corrected: Fetch open trades before checking
             open_trades = tracker.get_open_trades()
             if open_trades:
                 for asset in MONITORED_ASSETS:
@@ -1052,9 +1110,8 @@ def main():
                 worst_challenger = min(challengers, key=lambda x: x["performance"].get("win_rate", 0))
                 if worst_challenger["performance"].get("total_trades", 0) >= 5:
                     logger.info(f"Strategist: Optimizing underperforming strategy {worst_challenger['version']}...")
-                    optimized_strat = strategist.optimize_strategy(worst_challenger, worst_challenger["performance"])
+                    optimized_strat = strategist.optimize_strategy(worst_challenger, worst_challenger['performance'])
                     if optimized_strat:
-                        instrument = worst_challenger.get('instrument', 'XAU_USD')
                         registry.add_challenger(optimized_strat)
 
             for asset in MONITORED_ASSETS:
@@ -1065,16 +1122,10 @@ def main():
 
             portfolio_manager.check_health(exchange, notifier)
 
-            now_utc = datetime.now(timezone.utc)
-            # --- Daily Performance Summary ---
-            if now_utc.hour == 0 and now_utc.minute == 0:
+            if datetime.now().hour == 0 and datetime.now().minute == 0:
                 logger.info("Scheduling daily performance summary report...")
-                # Calculate precise PnL using transactions (Task 9)
-                from datetime import timedelta
                 day_start = (now_utc - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-
                 daily_stats = risk_manager.calculate_account_daily_pnl(exchange, day_start)
-
                 report_msg = (
                     f"📊 **Daily Verified Report**\n"
                     f"Date: {now_utc.strftime('%Y-%m-%d')}\n"
@@ -1086,7 +1137,6 @@ def main():
                 )
                 notifier.send_sync(report_msg)
 
-
             for asset in MONITORED_ASSETS:
                 manage_active_trades(exchange, tracker, notifier, asset['symbol'])
 
@@ -1096,7 +1146,6 @@ def main():
         logger.info("Bot stopped by user.")
     finally:
         release_lock("bot.lock")
-        # Ensure Telegram listener is stopped cleanly on exit
         try:
             notifier.stop_listener()
         except Exception as e:

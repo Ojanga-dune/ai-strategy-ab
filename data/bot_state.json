@@ -2,5 +2,12 @@
     "active_trades": {},
     "last_cycle_timestamp": null,
     "session_start_equity": null,
-    "boot_count": 33
+    "boot_count": 41,
+    "last_heartbeat_time": "2026-10-03T18:03:37.428217+00:00",
+    "heartbeat_due_at": "2026-10-03T22:03:37.428217+00:00",
+    "heartbeat_pending": false,
+    "heartbeat_retry_count": 0,
+    "heartbeat_next_retry_at": null,
+    "outage_generation_id": 0,
+    "recovery_notified_generation_id": 0
 }

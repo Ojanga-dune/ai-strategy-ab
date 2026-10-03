@@ -78,29 +78,41 @@ class StateManager:
                 del self.current_state["active_trades"][trade_id]
                 self.save_state()
 
-    def save_heartbeat_metrics(self, last_time: Optional[datetime], due_at: Optional[datetime], pending: bool = False, retry_count: int = 0, next_retry: Optional[datetime] = None):
-        """Persists heartbeat timestamps and retry state to disk."""
+    def save_heartbeat_metrics(self, last_time: Optional[datetime], due_at: Optional[datetime], pending: bool = False, retry_count: int = 0, next_retry: Optional[datetime] = None, runtime_state: Any = None):
+        """Persists heartbeat timestamps, outage tracking, and component health to disk."""
         with self._lock:
             self.current_state["last_heartbeat_time"] = last_time.isoformat() if last_time else None
             self.current_state["heartbeat_due_at"] = due_at.isoformat() if due_at else None
             self.current_state["heartbeat_pending"] = pending
             self.current_state["heartbeat_retry_count"] = retry_count
             self.current_state["heartbeat_next_retry_at"] = next_retry.isoformat() if next_retry else None
+
+            # Persist outage tracking and health
+            if runtime_state:
+                self.current_state["outage_generation_id"] = runtime_state.outage_generation_id
+                self.current_state["recovery_notified_generation_id"] = runtime_state.recovery_notified_generation_id
+                self.current_state["connectivity_health"] = runtime_state.connectivity_health
+                self.current_state["is_outage_active"] = runtime_state.is_outage_active
+
             self.save_state()
 
-    def load_heartbeat_metrics(self) -> Tuple[Optional[datetime], Optional[datetime], bool, int, Optional[datetime]]:
-        """Loads persisted heartbeat metrics."""
+    def load_heartbeat_metrics(self) -> Tuple[Optional[datetime], Optional[datetime], bool, int, Optional[datetime], int, int, Dict[str, bool], bool]:
+        """Loads persisted heartbeat metrics, outage tracking, and health state."""
         last_time_str = self.current_state.get("last_heartbeat_time")
         due_at_str = self.current_state.get("heartbeat_due_at")
         pending = self.current_state.get("heartbeat_pending", False)
         retry_count = self.current_state.get("heartbeat_retry_count", 0)
         next_retry_str = self.current_state.get("heartbeat_next_retry_at")
+        outage_gen = self.current_state.get("outage_generation_id", 0)
+        recovery_gen = self.current_state.get("recovery_notified_generation_id", 0)
+        health = self.current_state.get("connectivity_health", {"telegram": True, "broker": True})
+        outage_active = self.current_state.get("is_outage_active", False)
 
         last_time = datetime.fromisoformat(last_time_str) if last_time_str else None
         due_at = datetime.fromisoformat(due_at_str) if due_at_str else None
         next_retry = datetime.fromisoformat(next_retry_str) if next_retry_str else None
 
-        return last_time, due_at, pending, retry_count, next_retry
+        return last_time, due_at, pending, retry_count, next_retry, outage_gen, recovery_gen, health, outage_active
 
     def reconcile_with_broker(self, broker_positions: List[Dict[str, Any]]) -> Tuple[bool, str]:
         """

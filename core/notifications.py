@@ -2,6 +2,7 @@ import logging
 import asyncio
 import threading
 import time
+import telegram
 from telegram import Bot, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import TelegramError, Forbidden, InvalidToken, NetworkError, TimedOut
@@ -29,6 +30,8 @@ class NotificationManager:
         self._stop_event = threading.Event()
         self._is_permanently_disabled = False
         self.state = "STOPPED" # STOPPED, STARTING, RUNNING, DEGRADED, RECONNECTING, STOPPING, CONFLICT
+, CONFLICT
+        self.polling_generation_id = 0
 
         # Storage for command callbacks to be set by the orchestrator (live_main.py)
         self.callbacks: Dict[str, Callable] = {}
@@ -37,7 +40,8 @@ class NotificationManager:
         self._loop = None
         self._stop_event = threading.Event()
         self._is_permanently_disabled = False
-        self.state = "STOPPED" # STOPPED, STARTING, RUNNING, DEGRADED, RECONNECTING, STOPPING
+        self.state = "STOPPED" # STOPPED, STARTING, RUNNING, DEGRADED, RECONNECTING, STOPPING, CONFLICT
+
 
         if not token or not chat_id:
             logger.warning("Telegram credentials missing. Notifications and Command Control are disabled.")
@@ -125,7 +129,7 @@ class NotificationManager:
                 except Exception as e:
                     logger.error(f"Error executing message callback: {e}")
 
-    def start_listener(self):
+    def start_listener(self, orchestrator=None):
         """Starts the Telegram bot listener in a background thread with resilience."""
         if not self.token or self._is_permanently_disabled:
             return
@@ -169,8 +173,18 @@ class NotificationManager:
                     self.state = "CONFLICT"
                     logger.warning("Telegram Listener: Conflict detected (another instance polling). Stopping polling to avoid API ban.")
 
+                    # --- STRICT TEARDOWN SEQUENCE ---
+                    if self._app and self._loop and self._loop.is_running():
+                        try:
+                            logger.info("Performing strict teardown of conflicting Telegram Application...")
+                            asyncio.run_coroutine_threadsafe(self._app.stop(), self._loop).result(timeout=10)
+                            asyncio.run_coroutine_threadsafe(self._app.shutdown(), self._loop).result(timeout=10)
+                        except Exception as e:
+                            logger.error(f"Conflict teardown failed: {e}")
+
                     # Inspect local project processes for duplicates
                     import psutil
+                    import os
                     project_root = "C:\\Users\\Admin\\ai-strategy-lab"
                     duplicates = []
                     for proc in psutil.process_iter(['pid', 'cmdline']):
@@ -183,8 +197,6 @@ class NotificationManager:
 
                     if duplicates:
                         logger.warning(f"Detected local duplicate project processes: {duplicates}. Attempting to terminate duplicates...")
-                        # In a real production scenario, we would use the authoritative lock to decide who dies.
-                        # For now, we log it and apply bounded backoff.
 
                     # Bounded Exponential Backoff
                     if self._stop_event.wait(timeout=retry_delay):
@@ -194,12 +206,22 @@ class NotificationManager:
                 except (NetworkError, TimedOut) as e:
                     self.state = "RECONNECTING"
                     logger.warning(f"Telegram Listener: Transient network error ({e}). Retrying in {retry_delay}s...")
+
+                    # Notify orchestrator of transport failure without rebuilding App
+                    if orchestrator:
+                        orchestrator._enter_outage("telegram", e)
+
                     if self._stop_event.wait(timeout=retry_delay):
                         break
                     retry_delay = min(retry_delay * 2, max_delay)
                 except Exception as e:
                     self.state = "DEGRADED"
                     logger.error(f"Telegram Listener: Unexpected crash ({e}). Restarting in {retry_delay}s...")
+
+                    # Fatal crash: notify orchestrator and trigger full rebuild in next iteration
+                    if orchestrator:
+                        orchestrator._enter_outage("telegram", e)
+
                     if self._stop_event.wait(timeout=retry_delay):
                         break
                     retry_delay = min(retry_delay * 2, max_delay)

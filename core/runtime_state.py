@@ -28,6 +28,12 @@ class BotRuntimeState:
         self.next_retry_at = None
         self.current_heartbeat_future = None
 
+        # Outage Tracking
+        self.outage_generation_id = 0
+        self.recovery_notified_generation_id = 0
+        self.connectivity_health = {"telegram": True, "broker": True}
+        self.is_outage_active = False
+
         # Research Engine State
         self.research_engine_status = "HEALTHY"  # HEALTHY, DEGRADED
         self.last_research_failure_time = None
