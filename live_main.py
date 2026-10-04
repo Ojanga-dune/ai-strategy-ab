@@ -590,6 +590,12 @@ def cmd_status(text, context, exchange, runtime, compliance, tracker, breaker, n
     if summary and tracker.load_equity_snapshot():
         pnl = equity - tracker.load_equity_snapshot()
 
+    # Format equity display based on availability
+    if equity is not None:
+        equity_display = f"${equity:.2f}" + (" (Stale)" if not runtime.is_account_available else "")
+    else:
+        equity_display = "N/A"
+
     # Corrected: Use runtime state for account availability
     # Also wrap in try-except for safety if it calls other methods
     try:
@@ -789,6 +795,12 @@ class LiveBotOrchestrator:
             future = self.runtime_state.current_heartbeat_future
             if future.done():
                 try:
+                    # Verify the actual result of the Future
+                    result = future.result()
+                    if result is None:
+                        logger.warning("Recovery notification Future completed but returned None. Recovery not finalized.")
+                        return
+
                     # Confirmed delivery
                     start_wait = time.perf_counter()
                     logger.info(f"[LOCK_TRACE] finalize_recovery | Thread: {threading.get_ident()} | Action: Attempting lock")
@@ -812,11 +824,16 @@ class LiveBotOrchestrator:
                             runtime_state=self.runtime_state
                         )
 
+                        # ATOMIC CLEANUP: Prevent redundant finalizations
+                        self.runtime_state.current_heartbeat_future = None
+                        self.runtime_state.heartbeat_in_flight = False
+
                         hold_duration = (time.perf_counter() - start_hold) * 1000
                         logger.info(f"[LOCK_TRACE] finalize_recovery | Thread: {threading.get_ident()} | Action: Lock releasing | Duration: {hold_duration:.2f}ms")
                     logger.info(f"[LOCK_TRACE] finalize_recovery | Thread: {threading.get_ident()} | Action: Lock released")
                 except Exception as e:
-                    logger.warning(f"Recovery confirmation error: {e}")
+                    logger.warning(f"Recovery confirmation error (Future result failed): {e}")
+                    # Leave is_outage_active=True and let retry logic handle it
 
 def main():
     # --- Single Instance Lock ---
