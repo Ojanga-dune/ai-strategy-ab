@@ -95,7 +95,8 @@ class TestIDAlignment(unittest.TestCase):
             self.mock_reviewer, self.mock_risk_manager, self.mock_datalake,
             self.mock_notifier, self.tracker, self.mock_registry,
             self.mock_session_filter, self.mock_candle_guard, self.mock_news_guard,
-            self.mock_signal_tracker, self.mock_circuit_breaker
+            self.mock_signal_tracker, self.mock_circuit_breaker,
+            MagicMock()
         )
 
         # Verify a file was created in the test directory
@@ -185,7 +186,8 @@ class TestIDAlignment(unittest.TestCase):
             self.mock_reviewer, self.mock_risk_manager, self.mock_datalake,
             self.mock_notifier, self.tracker, self.mock_registry,
             self.mock_session_filter, self.mock_candle_guard, self.mock_news_guard,
-            self.mock_signal_tracker, self.mock_circuit_breaker
+            self.mock_signal_tracker, self.mock_circuit_breaker,
+            MagicMock()
         )
 
         # Verify a record was still created (using order_id as fallback for local_id)

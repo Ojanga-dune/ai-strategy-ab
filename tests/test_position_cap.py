@@ -73,7 +73,8 @@ class TestPositionCap(unittest.TestCase):
             self.mock_reviewer, self.mock_risk_manager, self.mock_datalake,
             self.mock_notifier, MagicMock(), self.mock_registry,
             self.mock_session_filter, self.mock_candle_guard, self.mock_news_guard,
-            self.mock_signal_tracker, self.mock_circuit_breaker
+            self.mock_signal_tracker, self.mock_circuit_breaker,
+            MagicMock()
         )
 
         # Verify that place_market_order was called
@@ -96,7 +97,8 @@ class TestPositionCap(unittest.TestCase):
             self.mock_reviewer, self.mock_risk_manager, self.mock_datalake,
             self.mock_notifier, MagicMock(), self.mock_registry,
             self.mock_session_filter, self.mock_candle_guard, self.mock_news_guard,
-            self.mock_signal_tracker, self.mock_circuit_breaker
+            self.mock_signal_tracker, self.mock_circuit_breaker,
+            MagicMock()
         )
 
         # Verify that place_market_order was NOT called

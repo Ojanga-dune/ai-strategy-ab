@@ -76,7 +76,8 @@ class TestOrderRetry(unittest.TestCase):
             self.mock_reviewer, self.mock_risk_manager, self.mock_datalake,
             self.mock_notifier, self.mock_tracker, self.mock_registry,
             self.mock_session_filter, self.mock_candle_guard, self.mock_news_guard,
-            self.mock_signal_tracker, self.mock_circuit_breaker
+            self.mock_signal_tracker, self.mock_circuit_breaker,
+            MagicMock()
         )
 
         self.assertEqual(self.mock_exchange.place_market_order.call_count, 2)
@@ -93,7 +94,8 @@ class TestOrderRetry(unittest.TestCase):
             self.mock_reviewer, self.mock_risk_manager, self.mock_datalake,
             self.mock_notifier, self.mock_tracker, self.mock_registry,
             self.mock_session_filter, self.mock_candle_guard, self.mock_news_guard,
-            self.mock_signal_tracker, self.mock_circuit_breaker
+            self.mock_signal_tracker, self.mock_circuit_breaker,
+            MagicMock()
         )
 
         self.assertEqual(self.mock_exchange.place_market_order.call_count, 1)
@@ -112,7 +114,8 @@ class TestOrderRetry(unittest.TestCase):
             self.mock_reviewer, self.mock_risk_manager, self.mock_datalake,
             self.mock_notifier, self.mock_tracker, self.mock_registry,
             self.mock_session_filter, self.mock_candle_guard, self.mock_news_guard,
-            self.mock_signal_tracker, self.mock_circuit_breaker
+            self.mock_signal_tracker, self.mock_circuit_breaker,
+            MagicMock()
         )
 
         self.assertEqual(self.mock_exchange.place_market_order.call_count, 3)
@@ -131,7 +134,8 @@ class TestOrderRetry(unittest.TestCase):
             self.mock_reviewer, self.mock_risk_manager, self.mock_datalake,
             self.mock_notifier, self.mock_tracker, self.mock_registry,
             self.mock_session_filter, self.mock_candle_guard, self.mock_news_guard,
-            self.mock_signal_tracker, self.mock_circuit_breaker
+            self.mock_signal_tracker, self.mock_circuit_breaker,
+            MagicMock()
         )
 
         self.assertEqual(self.mock_exchange.place_market_order.call_count, 2)
@@ -150,7 +154,8 @@ class TestOrderRetry(unittest.TestCase):
             self.mock_reviewer, self.mock_risk_manager, self.mock_datalake,
             self.mock_notifier, self.mock_tracker, self.mock_registry,
             self.mock_session_filter, self.mock_candle_guard, self.mock_news_guard,
-            self.mock_signal_tracker, self.mock_circuit_breaker
+            self.mock_signal_tracker, self.mock_circuit_breaker,
+            MagicMock()
         )
 
         self.assertEqual(self.mock_exchange.place_market_order.call_count, 2)
