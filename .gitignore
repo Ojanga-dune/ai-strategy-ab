@@ -1,18 +1,12 @@
-# Dependency and Environment
-.env
-__pycache__/
-*.py[cod]
-*$py.class
-.venv
-venv/
-ENV/
+# Runtime State
+bot.lock
+launcher_pid.txt
+bot_launch_log.txt
 
-# Data and Logs
-data/lake/**
+# Data and State
+data/bot_state.json
+data/test_*.json
+data/equity_snapshots/*.json
+
+# Logs
 logs/
-*.log
-
-# IDE
-.vscode/
-.idea/
-.env
