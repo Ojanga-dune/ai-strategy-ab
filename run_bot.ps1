@@ -39,13 +39,20 @@ function Rotate-Logs {
 # --- MUTEX ACQUISITION ---
 Write-BotLog "Acquiring launcher mutex..."
 $Mutex = New-Object System.Threading.Mutex($false, $MutexName)
+$mutexAcquired = $false
 try {
-    # Wait 0ms to see if it's already owned
-    if (!$Mutex.WaitOne(0)) {
+    # Attempt to acquire the mutex.
+    # If the previous owner crashed, this will throw System.Threading.AbandonedMutexException.
+    if ($Mutex.WaitOne(0)) {
+        $mutexAcquired = $true
+        Write-BotLog "Mutex acquired successfully."
+    } else {
         Write-BotLog "ERROR: Another launcher instance is already owning the mutex. Refusing to launch." "ERROR"
         exit 1
     }
-    Write-BotLog "Mutex acquired successfully."
+} catch [System.Threading.AbandonedMutexException] {
+    $mutexAcquired = $true
+    Write-BotLog "Detected abandoned mutex from a previous instance. Recovering ownership as the new authoritative launcher."
 } catch {
     Write-BotLog "ERROR: Mutex acquisition failed: $($_.Exception.Message)" "ERROR"
     exit 1
@@ -171,6 +178,8 @@ while ($true) {
 }
 
 # Final Cleanup
-Remove-Item $LockFile -Force
-$Mutex.ReleaseMutex()
+if ($mutexAcquired) {
+    $Mutex.ReleaseMutex()
+}
+$Mutex.Dispose()
 Write-BotLog "Mutex released. Launcher exiting."

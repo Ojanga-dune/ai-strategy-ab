@@ -625,7 +625,7 @@ def cmd_status(text, context, exchange, runtime, compliance, tracker, breaker, n
         f"Telegram: {telegram_status}\n"
         f"Simulation: {'Yes' if sim_mode else 'No'}\n"
         f"Account: {availability}\n"
-        f"Equity: ${equity if equity else 'N/A'}\n"
+        f"Equity: {equity_display}\n"
         f"Compliance: {comp_status}\n"
         f"----------------------------\n"
         f"Open Trades: {trade_count}\n"
@@ -663,7 +663,13 @@ class LiveBotOrchestrator:
         """
         Thread-safe, idempotent transition into an outage state.
         """
+        start_wait = time.perf_counter()
+        logger.info(f"[LOCK_TRACE] _enter_outage | Thread: {threading.get_ident()} | Action: Attempting lock")
         with self._outage_lock:
+            wait_duration = (time.perf_counter() - start_wait) * 1000
+            logger.info(f"[LOCK_TRACE] _enter_outage | Thread: {threading.get_ident()} | Action: Lock acquired | Wait: {wait_duration:.2f}ms")
+
+            start_hold = time.perf_counter()
             now_utc = datetime.now(timezone.utc)
 
             # Idempotency: Check if we are already in this outage generation
@@ -693,6 +699,10 @@ class LiveBotOrchestrator:
             )
             logger.info(f"Outage state persisted. Gen: {self.runtime_state.outage_generation_id} | Health: {self.runtime_state.connectivity_health}")
 
+            hold_duration = (time.perf_counter() - start_hold) * 1000
+            logger.info(f"[LOCK_TRACE] _enter_outage | Thread: {threading.get_ident()} | Action: Lock releasing | Duration: {hold_duration:.2f}ms")
+        logger.info(f"[LOCK_TRACE] _enter_outage | Thread: {threading.get_ident()} | Action: Lock released")
+
     def verify_connectivity(self) -> bool:
         """
         Strict validation of all critical dependencies before closing an outage.
@@ -720,10 +730,26 @@ class LiveBotOrchestrator:
             self.verify_connectivity() and
             not self.runtime_state.heartbeat_in_flight):
 
+            # --- IMMEDIATE STATE REFRESH ---
+            # We mark the connection as healthy BEFORE dispatching the notification
+            # so that /status is consistent the moment the user is notified.
+            self.exchange.connection_status = "CONNECTED"
+            self.runtime_state.connectivity_health = {"telegram": True, "broker": True}
+            # --------------------------------
+
+            start_wait = time.perf_counter()
+            logger.info(f"[LOCK_TRACE] handle_recovery | Thread: {threading.get_ident()} | Action: Attempting lock")
             with self._outage_lock:
+                wait_duration = (time.perf_counter() - start_wait) * 1000
+                logger.info(f"[LOCK_TRACE] handle_recovery | Thread: {threading.get_ident()} | Action: Lock acquired | Wait: {wait_duration:.2f}ms")
+
+                start_hold = time.perf_counter()
                 if self.runtime_state.outage_generation_id == self.runtime_state.recovery_notified_generation_id:
                     # Already notified for this generation
                     self.runtime_state.is_outage_active = False
+                    hold_duration = (time.perf_counter() - start_hold) * 1000
+                    logger.info(f"[LOCK_TRACE] handle_recovery | Thread: {threading.get_ident()} | Action: Lock releasing | Duration: {hold_duration:.2f}ms")
+                    logger.info(f"[LOCK_TRACE] handle_recovery | Thread: {threading.get_ident()} | Action: Lock released")
                     return
 
                 logger.info(f"Connectivity validated. Dispatching recovery for gen {self.runtime_state.outage_generation_id}...")
@@ -751,6 +777,10 @@ class LiveBotOrchestrator:
                 else:
                     logger.warning("Recovery message failed to schedule. Will retry next cycle.")
 
+                hold_duration = (time.perf_counter() - start_hold) * 1000
+                logger.info(f"[LOCK_TRACE] handle_recovery | Thread: {threading.get_ident()} | Action: Lock releasing | Duration: {hold_duration:.2f}ms")
+            logger.info(f"[LOCK_TRACE] handle_recovery | Thread: {threading.get_ident()} | Action: Lock released")
+
     def finalize_recovery(self, now_utc: datetime):
         """
         Closes the outage state only after confirmed delivery of recovery notification.
@@ -760,7 +790,13 @@ class LiveBotOrchestrator:
             if future.done():
                 try:
                     # Confirmed delivery
+                    start_wait = time.perf_counter()
+                    logger.info(f"[LOCK_TRACE] finalize_recovery | Thread: {threading.get_ident()} | Action: Attempting lock")
                     with self._outage_lock:
+                        wait_duration = (time.perf_counter() - start_wait) * 1000
+                        logger.info(f"[LOCK_TRACE] finalize_recovery | Thread: {threading.get_ident()} | Action: Lock acquired | Wait: {wait_duration:.2f}ms")
+
+                        start_hold = time.perf_counter()
                         logger.info(f"Recovery confirmed for outage gen {self.runtime_state.outage_generation_id}")
                         self.runtime_state.recovery_notified_generation_id = self.runtime_state.outage_generation_id
                         self.runtime_state.is_outage_active = False
@@ -775,6 +811,10 @@ class LiveBotOrchestrator:
                             self.runtime_state.next_retry_at,
                             runtime_state=self.runtime_state
                         )
+
+                        hold_duration = (time.perf_counter() - start_hold) * 1000
+                        logger.info(f"[LOCK_TRACE] finalize_recovery | Thread: {threading.get_ident()} | Action: Lock releasing | Duration: {hold_duration:.2f}ms")
+                    logger.info(f"[LOCK_TRACE] finalize_recovery | Thread: {threading.get_ident()} | Action: Lock released")
                 except Exception as e:
                     logger.warning(f"Recovery confirmation error: {e}")
 

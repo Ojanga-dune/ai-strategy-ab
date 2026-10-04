@@ -30,7 +30,7 @@ class NotificationManager:
         self._stop_event = threading.Event()
         self._is_permanently_disabled = False
         self.state = "STOPPED" # STOPPED, STARTING, RUNNING, DEGRADED, RECONNECTING, STOPPING, CONFLICT
-, CONFLICT
+
         self.polling_generation_id = 0
 
         # Storage for command callbacks to be set by the orchestrator (live_main.py)

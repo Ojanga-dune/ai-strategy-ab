@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
@@ -51,32 +52,55 @@ class StateManager:
         # but we add a check/internal lock if called externally.
         try:
             # 1. Serialize to string first to validate JSON
+            start_serialize = time.perf_counter()
             data_str = json.dumps(self.current_state, indent=4)
+            serialize_dur = (time.perf_counter() - start_serialize) * 1000
+            logger.info(f"[SAVE_TRACE] Serialization | Duration: {serialize_dur:.2f}ms")
 
             # 2. Write to temporary file in the same directory
             temp_file = self.state_path.with_suffix(".tmp")
+
+            start_write = time.perf_counter()
             with open(temp_file, 'w') as f:
                 f.write(data_str)
                 f.flush()
+                start_fsync = time.perf_counter()
                 os.fsync(f.fileno()) # Ensure it's on disk
+                fsync_dur = (time.perf_counter() - start_fsync) * 1000
+                logger.info(f"[SAVE_TRACE] fsync | Duration: {fsync_dur:.2f}ms")
+
+            write_dur = (time.perf_counter() - start_write) * 1000
+            logger.info(f"[SAVE_TRACE] Write/Flush | Duration: {write_dur:.2f}ms")
 
             # 3. Atomic replacement
+            start_replace = time.perf_counter()
             os.replace(temp_file, self.state_path)
+            replace_dur = (time.perf_counter() - start_replace) * 1000
+            logger.info(f"[SAVE_TRACE] os.replace | Duration: {replace_dur:.2f}ms")
         except Exception as e:
             logger.error(f"Atomic save failed for state file {self.state_path}: {e}")
 
     def update_trade(self, trade_id: str, data: Dict[str, Any]):
         """Updates or adds a trade to the active state."""
         with self._lock:
-            self.current_state["active_trades"][trade_id] = data
+            self._update_trade_unlocked(trade_id, data)
             self.save_state()
+
+    def _update_trade_unlocked(self, trade_id: str, data: Dict[str, Any]):
+        """Internal helper to update trade without acquiring lock."""
+        self.current_state["active_trades"][trade_id] = data
 
     def remove_trade(self, trade_id: str):
         """Removes a trade from active state upon closure."""
         with self._lock:
-            if trade_id in self.current_state["active_trades"]:
-                del self.current_state["active_trades"][trade_id]
-                self.save_state()
+            self._remove_trade_unlocked(trade_id)
+            self.save_state()
+
+    def _remove_trade_unlocked(self, trade_id: str):
+        """Internal helper to remove trade without acquiring lock."""
+        if trade_id in self.current_state["active_trades"]:
+            del self.current_state["active_trades"][trade_id]
+
 
     def save_heartbeat_metrics(self, last_time: Optional[datetime], due_at: Optional[datetime], pending: bool = False, retry_count: int = 0, next_retry: Optional[datetime] = None, runtime_state: Any = None):
         """Persists heartbeat timestamps, outage tracking, and component health to disk."""
@@ -131,7 +155,7 @@ class StateManager:
             for t_id in state_trade_ids:
                 if t_id not in broker_trade_ids:
                     logger.info(f"Reconciliation: Trade {t_id} closed on broker. Removing from active state.")
-                    self.remove_trade(t_id)
+                    self._remove_trade_unlocked(t_id)
                     mismatches.append(f"Trade {t_id} was closed on broker")
 
             # 2. Handle trades that exist on broker but aren't in state
@@ -157,7 +181,7 @@ class StateManager:
                         'strategy_version': "Unknown (Imported)",
                         'is_imported': True
                     }
-                    self.update_trade(t_id, imported_dna)
+                    self._update_trade_unlocked(t_id, imported_dna)
 
             if mismatches:
                 return False, " | ".join(mismatches)
