@@ -18,6 +18,9 @@ class BotRuntimeState:
         self.error_buffer = deque(maxlen=5)
         self.boot_count = 0
 
+        # Account Health State
+        self.is_account_available: Optional[bool] = None
+
         # Heartbeat tracking
         self.heartbeat_pending = False
         self.heartbeat_due_at = None
