@@ -590,7 +590,16 @@ def cmd_status(text, context, exchange, runtime, compliance, tracker, breaker, n
     if summary and tracker.load_equity_snapshot():
         pnl = equity - tracker.load_equity_snapshot()
 
-    comp_status = compliance.get_status_summary(equity if is_account_available else None, current_pnl)
+    # Corrected: Use runtime state for account availability
+    # Also wrap in try-except for safety if it calls other methods
+    try:
+        availability = "Available" if runtime.is_account_available is True else \
+                       "Unavailable" if runtime.is_account_available is False else "Unknown"
+        comp_status = compliance.get_status_summary(equity if runtime.is_account_available else None, pnl)
+    except Exception as e:
+        logger.error(f"Error calculating compliance status in cmd_status: {e}")
+        availability = "Error"
+        comp_status = "Status unavailable"
 
     open_trades = tracker.get_open_trades()
     trade_count = len(open_trades)
@@ -601,7 +610,6 @@ def cmd_status(text, context, exchange, runtime, compliance, tracker, breaker, n
     from core.state_manager import StateManager
     sm = StateManager()
     boot_count = sm.get_boot_count()
-
     errors = list(runtime.error_buffer)
     error_msg = "\n".join(errors) if errors else "None"
 
@@ -616,6 +624,7 @@ def cmd_status(text, context, exchange, runtime, compliance, tracker, breaker, n
         f"OANDA: {conn_status} ({env})\n"
         f"Telegram: {telegram_status}\n"
         f"Simulation: {'Yes' if sim_mode else 'No'}\n"
+        f"Account: {availability}\n"
         f"Equity: ${equity if equity else 'N/A'}\n"
         f"Compliance: {comp_status}\n"
         f"----------------------------\n"
@@ -934,24 +943,24 @@ def main():
             if summary is None:
                 logger.warning("Account summary unavailable. Checking for outage...")
                 orchestrator._enter_outage("broker", Exception("Account summary returned None"))
-                is_account_available = False
+                runtime_state.is_account_available = False
                 equity = None
                 balance = None
             else:
                 equity = summary['equity']
                 balance = summary['balance']
-                is_account_available = True
+                runtime_state.is_account_available = True
 
-            if is_account_available:
+            if runtime_state.is_account_available:
                 compliance_guard.update_daily_start(equity)
                 tracker.save_equity_snapshot(equity)
 
             start_equity = tracker.load_equity_snapshot()
             if start_equity is None:
-                start_equity = equity if is_account_available else 0.0
+                start_equity = equity if runtime_state.is_account_available else 0.0
 
-            current_pnl = (equity - start_equity) if is_account_available else 0.0
-            is_compliant, reason = compliance_guard.check_compliance(equity if is_account_available else None, current_pnl)
+            current_pnl = (equity - start_equity) if runtime_state.is_account_available else 0.0
+            is_compliant, reason = compliance_guard.check_compliance(equity if runtime_state.is_account_available else None, current_pnl)
 
             if not is_compliant:
                 error_msg = f"🚨 COMPLIANCE VIOLATION: {reason}\n\nExecuting Emergency Shutdown..."
@@ -1043,7 +1052,7 @@ def main():
                         f"💓 **Bot Heartbeat**\n"
                         f"Uptime: {runtime_state.get_uptime_str()}\n"
                         f"Cycles: {runtime_state.cycle_count}\n"
-                        f"Compliance: {compliance_guard.get_status_summary(equity if is_account_available else None, current_pnl)}\n"
+                        f"Compliance: {compliance_guard.get_status_summary(equity if runtime_state.is_account_available else None, current_pnl)}\n"
                         f"Trades: {len(tracker.get_open_trades())} open\n"
                         f"Env: {settings.get('oanda_env', 'unknown')} | Sim: {settings.get('simulation_mode', False)}"
                     )
